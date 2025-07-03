@@ -102,14 +102,15 @@ impl ChainStateSyncAdapter {
         let (chunk_headers_root, chunk_proofs) = merklize(
             &sync_prev_block
                 .chunks()
-                .iter_deprecated()
+                .iter()
                 .map(|shard_chunk| {
-                    ChunkHashHeight(shard_chunk.chunk_hash(), shard_chunk.height_included())
+                    ChunkHashHeight(shard_chunk.chunk_hash().clone(), shard_chunk.height_included())
                 })
                 .collect::<Vec<ChunkHashHeight>>(),
         );
         assert_eq!(&chunk_headers_root, sync_prev_block.header().chunk_headers_root());
 
+        // If the node was not tracking the shard it may not have the chunk in storage.
         let chunk = get_chunk_clone_from_header(&self.chain_store, chunk_header)?;
         let chunk_proof =
             chunk_proofs.get(prev_shard_index).ok_or(Error::InvalidShardId(shard_id))?.clone();
@@ -120,49 +121,49 @@ impl ChainStateSyncAdapter {
         )?;
 
         // Collecting the `prev` state.
-        let (prev_chunk_header, prev_chunk_proof, prev_chunk_height_included) = match self
-            .chain_store
-            .get_block(block_header.prev_hash())
-        {
-            Ok(prev_block) => {
-                let prev_chunk_header = prev_block
-                    .chunks()
-                    .get(prev_shard_index)
-                    .ok_or(Error::InvalidShardId(shard_id))?
-                    .clone();
-                let (prev_chunk_headers_root, prev_chunk_proofs) = merklize(
-                    &prev_block
+        let (prev_chunk_header, prev_chunk_proof, prev_chunk_height_included) =
+            match self.chain_store.get_block(block_header.prev_hash()) {
+                Ok(prev_block) => {
+                    let prev_chunk_header = prev_block
                         .chunks()
-                        .iter_deprecated()
-                        .map(|shard_chunk| {
-                            ChunkHashHeight(shard_chunk.chunk_hash(), shard_chunk.height_included())
-                        })
-                        .collect::<Vec<ChunkHashHeight>>(),
-                );
-                assert_eq!(&prev_chunk_headers_root, prev_block.header().chunk_headers_root());
+                        .get(prev_shard_index)
+                        .ok_or(Error::InvalidShardId(shard_id))?
+                        .clone();
+                    let (prev_chunk_headers_root, prev_chunk_proofs) = merklize(
+                        &prev_block
+                            .chunks()
+                            .iter()
+                            .map(|shard_chunk| {
+                                ChunkHashHeight(
+                                    shard_chunk.chunk_hash().clone(),
+                                    shard_chunk.height_included(),
+                                )
+                            })
+                            .collect::<Vec<ChunkHashHeight>>(),
+                    );
+                    assert_eq!(&prev_chunk_headers_root, prev_block.header().chunk_headers_root());
 
-                let prev_chunk_proof = prev_chunk_proofs
-                    .get(prev_shard_index)
-                    .ok_or(Error::InvalidShardId(shard_id))?
-                    .clone();
-                let prev_chunk_height_included = prev_chunk_header.height_included();
+                    let prev_chunk_proof = prev_chunk_proofs
+                        .get(prev_shard_index)
+                        .ok_or(Error::InvalidShardId(shard_id))?
+                        .clone();
+                    let prev_chunk_height_included = prev_chunk_header.height_included();
 
-                (Some(prev_chunk_header), Some(prev_chunk_proof), prev_chunk_height_included)
-            }
-            Err(e) => match e {
-                Error::DBNotFoundErr(_) => {
-                    if block_header.is_genesis() {
-                        (None, None, 0)
-                    } else {
-                        return Err(e);
-                    }
+                    (Some(prev_chunk_header), Some(prev_chunk_proof), prev_chunk_height_included)
                 }
-                _ => return Err(e),
-            },
-        };
+                Err(e) => match e {
+                    Error::DBNotFoundErr(_) => {
+                        if block_header.is_genesis() {
+                            (None, None, 0)
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    _ => return Err(e),
+                },
+            };
 
-        // Getting all existing incoming_receipts from prev_chunk height to the
-        // new epoch.
+        // Getting all existing incoming_receipts from prev_chunk height up to the sync hash.
         let incoming_receipts_proofs = get_incoming_receipts_for_shard(
             &self.chain_store,
             self.epoch_manager.as_ref(),
@@ -175,23 +176,24 @@ impl ChainStateSyncAdapter {
 
         // Collecting proofs for incoming receipts.
         let mut root_proofs = vec![];
-        for receipt_response in incoming_receipts_proofs.iter() {
+        for receipt_response in &incoming_receipts_proofs {
             let ReceiptProofResponse(block_hash, receipt_proofs) = receipt_response;
             let block_header = self.chain_store.get_block_header(&block_hash)?.clone();
             let block = self.chain_store.get_block(&block_hash)?;
             let (block_receipts_root, block_receipts_proofs) = merklize(
                 &block
                     .chunks()
-                    .iter_deprecated()
-                    .map(|chunk| chunk.prev_outgoing_receipts_root())
+                    .iter()
+                    .map(|chunk| *chunk.prev_outgoing_receipts_root())
                     .collect::<Vec<CryptoHash>>(),
             );
 
             let mut root_proofs_cur = vec![];
             if receipt_proofs.len() != block_header.chunks_included() as usize {
-                // Happens if a node doesn't track all shards and can't provide
-                // all incoming receipts to a chunk.
-                return Err(Error::Other("Not tracking all shards".to_owned()));
+                // Incoming receipts are saved to the store during block processing.
+                // If the node did not process the required blocks or was not tracking
+                // any shards during that time, it won't have the incoming receipts.
+                return Err(Error::Other("Store is missing incoming receipts".to_owned()));
             }
             for receipt_proof in receipt_proofs.iter() {
                 let ReceiptProof(receipts, shard_proof) = receipt_proof;
@@ -199,7 +201,7 @@ impl ChainStateSyncAdapter {
                 let receipts_hash = CryptoHash::hash_borsh(ReceiptList(shard_id, receipts));
                 let from_shard_index = prev_shard_layout.get_shard_index(*from_shard_id)?;
 
-                let root_proof = block.chunks()[from_shard_index].prev_outgoing_receipts_root();
+                let root_proof = *block.chunks()[from_shard_index].prev_outgoing_receipts_root();
                 root_proofs_cur
                     .push(RootProof(root_proof, block_receipts_proofs[from_shard_index].clone()));
 
@@ -281,7 +283,7 @@ impl ChainStateSyncAdapter {
         let _span = tracing::debug_span!(
             target: "sync",
             "get_state_response_part",
-            ?shard_id,
+            %shard_id,
             part_id,
             ?sync_hash)
         .entered();
@@ -355,7 +357,7 @@ impl ChainStateSyncAdapter {
     }
 
     pub fn set_state_header(
-        &mut self,
+        &self,
         shard_id: ShardId,
         sync_hash: CryptoHash,
         shard_state_header: ShardStateSyncResponseHeader,
@@ -383,7 +385,7 @@ impl ChainStateSyncAdapter {
         if !verify_path(
             *sync_prev_block_header.chunk_headers_root(),
             shard_state_header.chunk_proof(),
-            &ChunkHashHeight(chunk.chunk_hash(), chunk.height_included()),
+            &ChunkHashHeight(chunk.chunk_hash().clone(), chunk.height_included()),
         ) {
             byzantine_assert!(false);
             return Err(Error::Other(
@@ -405,7 +407,7 @@ impl ChainStateSyncAdapter {
                 if !verify_path(
                     *prev_block_header.chunk_headers_root(),
                     prev_chunk_proof,
-                    &ChunkHashHeight(prev_chunk_header.chunk_hash(), prev_chunk_header.height_included()),
+                    &ChunkHashHeight(prev_chunk_header.chunk_hash().clone(), prev_chunk_header.height_included()),
                 ) {
                     byzantine_assert!(false);
                     return Err(Error::Other(
@@ -518,7 +520,7 @@ impl ChainStateSyncAdapter {
     }
 
     pub fn set_state_part(
-        &mut self,
+        &self,
         shard_id: ShardId,
         sync_hash: CryptoHash,
         part_id: PartId,

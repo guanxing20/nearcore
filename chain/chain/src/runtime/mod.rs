@@ -1,8 +1,8 @@
 use crate::Error;
 use crate::types::{
     ApplyChunkBlockContext, ApplyChunkResult, ApplyChunkShardContext,
-    PrepareTransactionsBlockContext, PrepareTransactionsChunkContext, PrepareTransactionsLimit,
-    PreparedTransactions, RuntimeAdapter, RuntimeStorageConfig, StorageDataSource, Tip,
+    PrepareTransactionsBlockContext, PrepareTransactionsLimit, PreparedTransactions,
+    RuntimeAdapter, RuntimeStorageConfig, StorageDataSource, Tip,
 };
 use borsh::BorshDeserialize;
 use errors::FromStateViewerErrors;
@@ -14,6 +14,7 @@ use near_epoch_manager::{EpochManagerAdapter, EpochManagerHandle};
 use near_parameters::{RuntimeConfig, RuntimeConfigStore};
 use near_pool::types::TransactionGroupIterator;
 use near_primitives::account::{AccessKey, Account};
+use near_primitives::action::GlobalContractIdentifier;
 use near_primitives::apply::ApplyChunkReason;
 use near_primitives::congestion_info::{
     CongestionControl, ExtendedCongestionInfo, RejectTransactionReason, ShardAcceptsTransactions,
@@ -162,8 +163,8 @@ impl NightshadeRuntime {
         state_patch: SandboxStatePatch,
     ) -> Result<ApplyChunkResult, Error> {
         let ApplyChunkBlockContext {
+            block_type: _,
             height: block_height,
-            block_hash,
             ref prev_block_hash,
             block_timestamp,
             gas_price,
@@ -238,7 +239,6 @@ impl NightshadeRuntime {
             apply_reason,
             block_height,
             prev_block_hash: *prev_block_hash,
-            block_hash,
             shard_id,
             epoch_id,
             epoch_height,
@@ -252,6 +252,7 @@ impl NightshadeRuntime {
             is_new_chunk,
             congestion_info,
             bandwidth_requests,
+            trie_access_tracker_state: Default::default(),
         };
 
         let instant = Instant::now();
@@ -387,11 +388,11 @@ impl NightshadeRuntime {
             target: "runtime",
             "obtain_state_part",
             part_id = part_id.idx,
-            ?shard_id,
+            %shard_id,
             %prev_hash,
             num_parts = part_id.total)
         .entered();
-        tracing::debug!(target: "state-parts", ?shard_id, ?prev_hash, ?state_root, ?part_id, "obtain_state_part");
+        tracing::debug!(target: "state-parts", %shard_id, ?prev_hash, ?state_root, ?part_id, "obtain_state_part");
 
         let epoch_id = self.epoch_manager.get_epoch_id_from_prev_block(prev_hash)?;
         let shard_uid = self.get_shard_uid_from_epoch_id(shard_id, &epoch_id)?;
@@ -428,6 +429,31 @@ impl NightshadeRuntime {
             .expect("serializer should not fail");
 
         Ok(state_part)
+    }
+
+    fn query_view_global_contract_code(
+        &self,
+        identifier: GlobalContractIdentifier,
+        shard_uid: ShardUId,
+        state_root: &StateRoot,
+        block_height: BlockHeight,
+        block_hash: &CryptoHash,
+    ) -> Result<QueryResponse, crate::near_chain_primitives::error::QueryError> {
+        let contract_code =
+            self.view_global_contract_code(&shard_uid, *state_root, identifier).map_err(|err| {
+                crate::near_chain_primitives::error::QueryError::from_view_contract_code_error(
+                    err,
+                    block_height,
+                    *block_hash,
+                )
+            })?;
+        let hash = *contract_code.hash();
+        let contract_code_view = ContractCodeView { hash, code: contract_code.into_code() };
+        Ok(QueryResponse {
+            kind: QueryResponseKind::ViewCode(contract_code_view),
+            block_height,
+            block_hash: *block_hash,
+        })
     }
 }
 
@@ -529,7 +555,8 @@ impl RuntimeAdapter for NightshadeRuntime {
     ) -> Result<(), InvalidTxError> {
         let runtime_config = self.runtime_config_store.get_config(current_protocol_version);
 
-        let cost = tx_cost(runtime_config, &validated_tx.to_tx(), gas_price)?;
+        let cost =
+            tx_cost(runtime_config, &validated_tx.to_tx(), gas_price, current_protocol_version)?;
         let shard_uid = shard_layout
             .account_id_to_shard_uid(validated_tx.to_signed_tx().transaction.signer_id());
         let state_update = self.tries.new_trie_update(shard_uid, state_root);
@@ -550,14 +577,13 @@ impl RuntimeAdapter for NightshadeRuntime {
     fn prepare_transactions(
         &self,
         storage_config: RuntimeStorageConfig,
-        chunk: PrepareTransactionsChunkContext,
+        shard_id: ShardId,
         prev_block: PrepareTransactionsBlockContext,
         transaction_groups: &mut dyn TransactionGroupIterator,
         chain_validate: &dyn Fn(&SignedTransaction) -> bool,
         time_limit: Option<Duration>,
     ) -> Result<PreparedTransactions, Error> {
         let start_time = std::time::Instant::now();
-        let PrepareTransactionsChunkContext { shard_id, .. } = chunk;
 
         let epoch_id = self.epoch_manager.get_epoch_id_from_prev_block(&prev_block.block_hash)?;
         let protocol_version = self.epoch_manager.get_epoch_protocol_version(&epoch_id)?;
@@ -578,7 +604,7 @@ impl RuntimeAdapter for NightshadeRuntime {
                 // flat storage by not charging gas for trie nodes.
                 // WARNING: should never be used in production! Consider this option only for debugging or replaying blocks.
                 let mut trie = self.tries.get_trie_for_shard(shard_uid, storage_config.state_root);
-                trie.set_charge_gas_for_trie_node_access(false);
+                trie.set_use_trie_accounting_cache(false);
                 trie
             }
             StorageDataSource::Recorded(storage) => Trie::from_recorded_storage(
@@ -629,7 +655,8 @@ impl RuntimeAdapter for NightshadeRuntime {
                 }
             }
 
-            if state_update.trie.recorded_storage_size()
+            // FIXME(nagisa): why is this not using `check_proof_size_limit_exceed`? Comment.
+            if state_update.trie.recorded_storage_size() as u64
                 > runtime_config.witness_config.new_transactions_validation_state_size_soft_limit
             {
                 result.limited_by = Some(PrepareTransactionsLimit::StorageProofSize);
@@ -675,28 +702,27 @@ impl RuntimeAdapter for NightshadeRuntime {
                 let (mut signer, mut access_key) =
                     get_signer_and_access_key(&state_update, &validated_tx)
                         .map_err(|_| Error::InvalidTransactions)?;
-                let verify_result =
-                    tx_cost(runtime_config, &validated_tx.to_tx(), prev_block.next_gas_price)
-                        .map_err(InvalidTxError::from)
-                        .and_then(|cost| {
-                            verify_and_charge_tx_ephemeral(
-                                runtime_config,
-                                &mut signer,
-                                &mut access_key,
-                                &validated_tx,
-                                &cost,
-                                Some(next_block_height),
-                            )
-                        })
-                        .and_then(|verification_res| {
-                            set_tx_state_changes(
-                                &mut state_update,
-                                &validated_tx,
-                                &signer,
-                                &access_key,
-                            );
-                            Ok(verification_res)
-                        });
+                let verify_result = tx_cost(
+                    runtime_config,
+                    &validated_tx.to_tx(),
+                    prev_block.next_gas_price,
+                    protocol_version,
+                )
+                .map_err(InvalidTxError::from)
+                .and_then(|cost| {
+                    verify_and_charge_tx_ephemeral(
+                        runtime_config,
+                        &mut signer,
+                        &mut access_key,
+                        &validated_tx,
+                        &cost,
+                        Some(next_block_height),
+                    )
+                })
+                .and_then(|verification_res| {
+                    set_tx_state_changes(&mut state_update, &validated_tx, &signer, &access_key);
+                    Ok(verification_res)
+                });
 
                 match verify_result {
                     Ok(cost) => {
@@ -758,7 +784,7 @@ impl RuntimeAdapter for NightshadeRuntime {
         }
     }
 
-    #[instrument(target = "runtime", level = "info", skip_all, fields(shard_id = ?chunk.shard_id))]
+    #[instrument(target = "runtime", level = "info", skip_all, fields(height = block.height, shard_id = %chunk.shard_id))]
     fn apply_chunk(
         &self,
         storage_config: RuntimeStorageConfig,
@@ -790,7 +816,7 @@ impl RuntimeAdapter for NightshadeRuntime {
                     storage_config.state_root,
                     false,
                 )?;
-                trie.set_charge_gas_for_trie_node_access(false);
+                trie.set_use_trie_accounting_cache(false);
                 trie
             }
             StorageDataSource::Recorded(storage) => Trie::from_recorded_storage(
@@ -890,7 +916,6 @@ impl RuntimeAdapter for NightshadeRuntime {
                         block_height,
                         block_timestamp,
                         prev_block_hash,
-                        block_hash,
                         epoch_height,
                         epoch_id,
                         account_id,
@@ -977,6 +1002,22 @@ impl RuntimeAdapter for NightshadeRuntime {
                     block_hash: *block_hash,
                 })
             }
+            QueryRequest::ViewGlobalContractCode { code_hash } => self
+                .query_view_global_contract_code(
+                    GlobalContractIdentifier::CodeHash(*code_hash),
+                    shard_uid,
+                    state_root,
+                    block_height,
+                    block_hash,
+                ),
+            QueryRequest::ViewGlobalContractCodeByAccountId { account_id } => self
+                .query_view_global_contract_code(
+                    GlobalContractIdentifier::AccountId(account_id.clone()),
+                    shard_uid,
+                    state_root,
+                    block_height,
+                    block_hash,
+                ),
         }
     }
 
@@ -992,7 +1033,7 @@ impl RuntimeAdapter for NightshadeRuntime {
             target: "runtime",
             "obtain_state_part",
             part_id = part_id.idx,
-            ?shard_id,
+            %shard_id,
             %prev_hash,
             ?state_root,
             num_parts = part_id.total)
@@ -1247,7 +1288,7 @@ impl node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntime {
         account_id: &AccountId,
     ) -> Result<ContractCode, node_runtime::state_viewer::errors::ViewContractCodeError> {
         let state_update = self.tries.new_trie_update_view(*shard_uid, state_root);
-        self.trie_viewer.view_contract_code(&state_update, account_id)
+        self.trie_viewer.view_account_contract_code(&state_update, account_id)
     }
 
     fn call_function(
@@ -1257,7 +1298,6 @@ impl node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntime {
         height: BlockHeight,
         block_timestamp: u64,
         prev_block_hash: &CryptoHash,
-        block_hash: &CryptoHash,
         epoch_height: EpochHeight,
         epoch_id: &EpochId,
         contract_id: &AccountId,
@@ -1272,7 +1312,6 @@ impl node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntime {
             shard_id: shard_uid.shard_id(),
             block_height: height,
             prev_block_hash: *prev_block_hash,
-            block_hash: *block_hash,
             epoch_id: *epoch_id,
             epoch_height,
             block_timestamp,
@@ -1322,5 +1361,15 @@ impl node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntime {
     ) -> Result<ViewStateResult, node_runtime::state_viewer::errors::ViewStateError> {
         let state_update = self.tries.new_trie_update_view(*shard_uid, state_root);
         self.trie_viewer.view_state(&state_update, account_id, prefix, include_proof)
+    }
+
+    fn view_global_contract_code(
+        &self,
+        shard_uid: &ShardUId,
+        state_root: MerkleHash,
+        identifier: GlobalContractIdentifier,
+    ) -> Result<ContractCode, node_runtime::state_viewer::errors::ViewContractCodeError> {
+        let state_update = self.tries.new_trie_update_view(*shard_uid, state_root);
+        self.trie_viewer.view_global_contract_code(&state_update, identifier)
     }
 }

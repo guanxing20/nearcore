@@ -41,6 +41,7 @@ use near_network::types::{
 use near_performance_metrics_macros::perf;
 use near_primitives::block::{Block, BlockHeader};
 use near_primitives::epoch_info::EpochInfo;
+use near_primitives::errors::EpochError;
 use near_primitives::hash::CryptoHash;
 use near_primitives::merkle::{PartialMerkleTree, merklize};
 use near_primitives::network::AnnounceAccount;
@@ -50,12 +51,10 @@ use near_primitives::state_sync::{
     ShardStateSyncResponse, ShardStateSyncResponseHeader, ShardStateSyncResponseV3,
 };
 use near_primitives::stateless_validation::ChunkProductionKey;
-use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::{
-    AccountId, BlockHeight, BlockId, BlockReference, EpochReference, Finality, MaybeBlockId,
-    ShardId, SyncCheckpoint, TransactionOrReceiptId, ValidatorInfoIdentifier,
+    AccountId, BlockHeight, BlockId, BlockReference, EpochId, EpochReference, Finality,
+    MaybeBlockId, ShardId, SyncCheckpoint, TransactionOrReceiptId, ValidatorInfoIdentifier,
 };
-use near_primitives::validator_signer::ValidatorSigner;
 use near_primitives::views::validator_stake_view::ValidatorStakeView;
 use near_primitives::views::{
     BlockView, ChunkView, EpochValidatorInfo, ExecutionOutcomeWithIdView, ExecutionStatusView,
@@ -64,21 +63,19 @@ use near_primitives::views::{
     SignedTransactionView, SplitStorageInfoView, StateChangesKindsView, StateChangesView,
     TxExecutionStatus, TxStatusView,
 };
-use near_store::flat::{FlatStorageReadyStatus, FlatStorageStatus};
 use near_store::{COLD_HEAD_KEY, DBCol, FINAL_HEAD_KEY, HEAD_KEY};
+use parking_lot::{Mutex, RwLock};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Max number of queries that we keep.
 const QUERY_REQUEST_LIMIT: usize = 500;
 /// Waiting time between requests, in ms
 const REQUEST_WAIT_TIME: i64 = 1000;
-
-const POISONED_LOCK_ERR: &str = "The lock was poisoned.";
 
 /// Request and response manager across all instances of ViewClientActor.
 pub struct ViewClientRequestManager {
@@ -94,11 +91,6 @@ pub type ViewClientActor = SyncActixWrapper<ViewClientActorInner>;
 pub struct ViewClientActorInner {
     clock: Clock,
     pub adv: crate::adversarial::Controls,
-
-    /// Validator account (if present). This field is mutable and optional. Use with caution!
-    /// Lock the value of mutable validator signer for the duration of a request to ensure consistency.
-    /// Please note that the locked value should not be stored anywhere or passed through the thread boundary.
-    validator: MutableValidatorSigner,
     pub chain: Chain,
     epoch_manager: Arc<dyn EpochManagerAdapter>,
     shard_tracker: ShardTracker,
@@ -126,7 +118,6 @@ impl ViewClientActorInner {
 
     pub fn spawn_actix_actor(
         clock: Clock,
-        validator: MutableValidatorSigner,
         chain_genesis: ChainGenesis,
         epoch_manager: Arc<dyn EpochManagerAdapter>,
         shard_tracker: ShardTracker,
@@ -134,11 +125,11 @@ impl ViewClientActorInner {
         network_adapter: PeerManagerAdapter,
         config: ClientConfig,
         adv: crate::adversarial::Controls,
+        validator_signer: MutableValidatorSigner,
     ) -> Addr<ViewClientActor> {
         SyncArbiter::start(config.view_client_threads, move || {
             let view_client_actor = ViewClientActorInner::new(
                 clock.clone(),
-                validator.clone(),
                 chain_genesis.clone(),
                 epoch_manager.clone(),
                 shard_tracker.clone(),
@@ -146,6 +137,7 @@ impl ViewClientActorInner {
                 network_adapter.clone(),
                 config.clone(),
                 adv.clone(),
+                validator_signer.clone(),
             )
             .unwrap();
             SyncActixWrapper::new(view_client_actor)
@@ -154,7 +146,6 @@ impl ViewClientActorInner {
 
     pub fn new(
         clock: Clock,
-        validator: MutableValidatorSigner,
         chain_genesis: ChainGenesis,
         epoch_manager: Arc<dyn EpochManagerAdapter>,
         shard_tracker: ShardTracker,
@@ -162,6 +153,7 @@ impl ViewClientActorInner {
         network_adapter: PeerManagerAdapter,
         config: ClientConfig,
         adv: crate::adversarial::Controls,
+        validator_signer: MutableValidatorSigner,
     ) -> Result<Self, Error> {
         // TODO: should we create shared ChainStore that is passed to both Client and ViewClient?
         let chain = Chain::new_for_view_client(
@@ -172,11 +164,11 @@ impl ViewClientActorInner {
             &chain_genesis,
             DoomslugThresholdMode::TwoThirds,
             config.save_trie_changes,
+            validator_signer,
         )?;
         Ok(Self {
             clock,
             adv,
-            validator,
             chain,
             epoch_manager,
             shard_tracker,
@@ -191,7 +183,7 @@ impl ViewClientActorInner {
     fn maybe_block_id_to_block_header(
         &self,
         block_id: MaybeBlockId,
-    ) -> Result<BlockHeader, near_chain::Error> {
+    ) -> Result<Arc<BlockHeader>, near_chain::Error> {
         match block_id {
             None => {
                 let block_hash = self.chain.head()?.last_block_hash;
@@ -233,11 +225,11 @@ impl ViewClientActorInner {
     ///
     /// Returns `None` if the reference is a `SyncCheckpoint::EarliestAvailable`
     /// reference and no such block exists yet.  This is typically translated by
-    /// the caller into some form of ‘no sync block’ higher-level error.
+    /// the caller into some form of 'no sync block' higher-level error.
     fn get_block_header_by_reference(
         &self,
         reference: &BlockReference,
-    ) -> Result<Option<BlockHeader>, near_chain::Error> {
+    ) -> Result<Option<Arc<BlockHeader>>, near_chain::Error> {
         match reference {
             BlockReference::BlockId(BlockId::Height(block_height)) => {
                 self.chain.get_block_header_by_height(*block_height).map(Some)
@@ -250,7 +242,7 @@ impl ViewClientActorInner {
                 .and_then(|block_hash| self.chain.get_block_header(&block_hash))
                 .map(Some),
             BlockReference::SyncCheckpoint(SyncCheckpoint::Genesis) => {
-                Ok(Some(self.chain.genesis().clone()))
+                Ok(Some(self.chain.genesis().clone().into()))
             }
             BlockReference::SyncCheckpoint(SyncCheckpoint::EarliestAvailable) => {
                 let block_hash = match self.chain.get_earliest_block_hash()? {
@@ -266,11 +258,11 @@ impl ViewClientActorInner {
     ///
     /// Returns `None` if the reference is a `SyncCheckpoint::EarliestAvailable`
     /// reference and no such block exists yet.  This is typically translated by
-    /// the caller into some form of ‘no sync block’ higher-level error.
+    /// the caller into some form of 'no sync block' higher-level error.
     fn get_block_by_reference(
         &self,
         reference: &BlockReference,
-    ) -> Result<Option<Block>, near_chain::Error> {
+    ) -> Result<Option<Arc<Block>>, near_chain::Error> {
         match reference {
             BlockReference::BlockId(BlockId::Height(block_height)) => {
                 self.chain.get_block_by_height(*block_height).map(Some)
@@ -283,7 +275,7 @@ impl ViewClientActorInner {
                 .and_then(|block_hash| self.chain.get_block(&block_hash))
                 .map(Some),
             BlockReference::SyncCheckpoint(SyncCheckpoint::Genesis) => {
-                Ok(Some(self.chain.genesis_block().clone()))
+                Ok(Some(self.chain.genesis_block().into()))
             }
             BlockReference::SyncCheckpoint(SyncCheckpoint::EarliestAvailable) => {
                 let block_hash = match self.chain.get_earliest_block_hash()? {
@@ -349,7 +341,7 @@ impl ViewClientActorInner {
         Ok(windows)
     }
 
-    fn handle_query(&mut self, msg: Query) -> Result<QueryResponse, QueryError> {
+    fn handle_query(&self, msg: Query) -> Result<QueryResponse, QueryError> {
         let header = self.get_block_header_by_reference(&msg.block_reference);
         let header = match header {
             Ok(Some(header)) => Ok(header),
@@ -363,17 +355,9 @@ impl ViewClientActorInner {
             Err(err) => Err(QueryError::Unreachable { error_message: err.to_string() }),
         }?;
 
-        let account_id = match &msg.request {
-            QueryRequest::ViewAccount { account_id, .. } => account_id,
-            QueryRequest::ViewState { account_id, .. } => account_id,
-            QueryRequest::ViewAccessKey { account_id, .. } => account_id,
-            QueryRequest::ViewAccessKeyList { account_id, .. } => account_id,
-            QueryRequest::CallFunction { account_id, .. } => account_id,
-            QueryRequest::ViewCode { account_id, .. } => account_id,
-        };
-        let shard_id =
-            account_id_to_shard_id(self.epoch_manager.as_ref(), account_id, header.epoch_id())
-                .map_err(|err| QueryError::InternalError { error_message: err.to_string() })?;
+        let shard_id = self
+            .query_shard_uid(&msg.request, *header.epoch_id())
+            .map_err(|err| QueryError::InternalError { error_message: err.to_string() })?;
         let shard_uid =
             shard_id_to_uid(self.epoch_manager.as_ref(), shard_id, header.epoch_id())
                 .map_err(|err| QueryError::InternalError { error_message: err.to_string() })?;
@@ -456,7 +440,35 @@ impl ViewClientActorInner {
                     block_height,
                     block_hash,
                 },
+                near_chain::near_chain_primitives::error::QueryError::NoGlobalContractCode {
+                    identifier,
+                    block_height,
+                    block_hash,
+                } => QueryError::NoGlobalContractCode { identifier, block_height, block_hash },
             }),
+        }
+    }
+
+    fn query_shard_uid(
+        &self,
+        request: &QueryRequest,
+        epoch_id: EpochId,
+    ) -> Result<ShardId, EpochError> {
+        match &request {
+            QueryRequest::ViewAccount { account_id, .. }
+            | QueryRequest::ViewState { account_id, .. }
+            | QueryRequest::ViewAccessKey { account_id, .. }
+            | QueryRequest::ViewAccessKeyList { account_id, .. }
+            | QueryRequest::CallFunction { account_id, .. }
+            | QueryRequest::ViewCode { account_id, .. } => {
+                account_id_to_shard_id(self.epoch_manager.as_ref(), account_id, &epoch_id)
+            }
+            QueryRequest::ViewGlobalContractCode { .. }
+            | QueryRequest::ViewGlobalContractCodeByAccountId { .. } => {
+                // for global contract queries we can use any shard_id, so just take the first one
+                let shard_ids = self.epoch_manager.shard_ids(&epoch_id)?;
+                Ok(*shard_ids.iter().next().expect("at least one shard should always exist"))
+            }
         }
     }
 
@@ -503,10 +515,9 @@ impl ViewClientActorInner {
             awaiting_non_refund_receipt_ids.is_subset(&executed_receipt_ids);
         let executed_including_refunds = awaiting_receipt_ids.is_subset(&executed_receipt_ids);
 
-        if let Err(_) = self.chain.check_blocks_final_and_canonical(&[self
-            .chain
-            .get_block_header(&execution_outcome.transaction_outcome.block_hash)?])
-        {
+        let blocks =
+            [self.chain.get_block_header(&execution_outcome.transaction_outcome.block_hash)?];
+        if let Err(_) = self.chain.check_blocks_final_and_canonical(blocks.iter().map(|b| &**b)) {
             return if executed_ignoring_refunds {
                 Ok(TxExecutionStatus::ExecutedOptimistic)
             } else {
@@ -529,23 +540,22 @@ impl ViewClientActorInner {
         }
         // We can't sort and check only the last block;
         // previous blocks may be not in the canonical chain
-        Ok(match self.chain.check_blocks_final_and_canonical(&headers) {
+        Ok(match self.chain.check_blocks_final_and_canonical(headers.iter().map(|v| &**v)) {
             Err(_) => TxExecutionStatus::Executed,
             Ok(_) => TxExecutionStatus::Final,
         })
     }
 
     fn get_tx_status(
-        &mut self,
+        &self,
         tx_hash: CryptoHash,
         signer_account_id: AccountId,
         fetch_receipt: bool,
-        validator_signer: &Option<Arc<ValidatorSigner>>,
     ) -> Result<TxStatusView, TxStatusError> {
         {
             // TODO(telezhnaya): take into account `fetch_receipt()`
             // https://github.com/near/nearcore/issues/9545
-            let mut request_manager = self.request_manager.write().expect(POISONED_LOCK_ERR);
+            let mut request_manager = self.request_manager.write();
             if let Some(res) = request_manager.tx_status_response.pop(&tx_hash) {
                 request_manager.tx_status_requests.pop(&tx_hash);
                 let status = self.get_tx_execution_status(&res)?;
@@ -563,12 +573,7 @@ impl ViewClientActorInner {
             account_id_to_shard_id(self.epoch_manager.as_ref(), &signer_account_id, &head.epoch_id)
                 .map_err(|err| TxStatusError::InternalError(err.to_string()))?;
         // Check if we are tracking this shard.
-        if self.shard_tracker.cares_about_shard(
-            validator_signer.as_ref().map(|v| v.validator_id()),
-            &head.prev_block_hash,
-            target_shard_id,
-            true,
-        ) {
+        if self.shard_tracker.cares_about_shard(&head.prev_block_hash, target_shard_id) {
             match self.chain.get_partial_transaction_result(&tx_hash) {
                 Ok(tx_result) => {
                     let status = self.get_tx_execution_status(&tx_result)?;
@@ -586,8 +591,8 @@ impl ViewClientActorInner {
                 Err(near_chain::Error::DBNotFoundErr(_)) => {
                     if let Ok(Some(transaction)) = self.chain.chain_store.get_transaction(&tx_hash)
                     {
-                        let transaction: SignedTransactionView =
-                            SignedTransaction::clone(&transaction).into();
+                        let transaction =
+                            SignedTransactionView::from(Arc::unwrap_or_clone(transaction));
                         if let Ok(tx_outcome) = self.chain.get_execution_outcome(&tx_hash) {
                             let outcome = FinalExecutionOutcomeViewEnum::FinalExecutionOutcome(
                                 FinalExecutionOutcomeView {
@@ -617,7 +622,7 @@ impl ViewClientActorInner {
                 }
             }
         } else {
-            let mut request_manager = self.request_manager.write().expect(POISONED_LOCK_ERR);
+            let mut request_manager = self.request_manager.write();
             if self.need_request(tx_hash, &mut request_manager.tx_status_requests) {
                 let target_shard_id = account_id_to_shard_id(
                     self.epoch_manager.as_ref(),
@@ -644,10 +649,10 @@ impl ViewClientActorInner {
     }
 
     fn retrieve_headers(
-        &mut self,
+        &self,
         hashes: Vec<CryptoHash>,
-    ) -> Result<Vec<BlockHeader>, near_chain::Error> {
-        retrieve_headers(self.chain.chain_store(), hashes, sync::header::MAX_BLOCK_HEADERS, None)
+    ) -> Result<Vec<Arc<BlockHeader>>, near_chain::Error> {
+        retrieve_headers(self.chain.chain_store(), hashes, sync::header::MAX_BLOCK_HEADERS)
     }
 
     fn check_signature_account_announce(
@@ -668,7 +673,7 @@ impl ViewClientActorInner {
     /// Returns true if this request needs to be **dropped** due to exceeding a
     /// rate limit of state sync requests.
     fn throttle_state_sync_request(&self) -> bool {
-        let mut cache = self.state_request_cache.lock().expect(POISONED_LOCK_ERR);
+        let mut cache = self.state_request_cache.lock();
         let now = self.clock.now();
         while let Some(&instant) = cache.front() {
             if now - instant > self.config.view_client_throttle_period {
@@ -684,27 +689,6 @@ impl ViewClientActorInner {
         }
         cache.push_back(now);
         false
-    }
-
-    fn has_state_snapshot(&self, sync_hash: &CryptoHash, shard_id: ShardId) -> Result<bool, Error> {
-        let header = self.chain.get_block_header(sync_hash)?;
-        let prev_header = self.chain.get_block_header(header.prev_hash())?;
-        let prev_epoch_id = prev_header.epoch_id();
-        let shard_uid = shard_id_to_uid(self.epoch_manager.as_ref(), shard_id, prev_epoch_id)?;
-        let sync_prev_prev_hash = prev_header.prev_hash();
-        let status = self
-            .runtime
-            .get_tries()
-            .get_snapshot_flat_storage_status(*sync_prev_prev_hash, shard_uid)
-            .map_err(|err| Error::Other(err.to_string()))?;
-        match status {
-            FlatStorageStatus::Ready(FlatStorageReadyStatus { flat_head }) => {
-                let flat_head_header = self.chain.get_block_header(&flat_head.hash)?;
-                let flat_head_epoch_id = flat_head_header.epoch_id();
-                Ok(flat_head_epoch_id == prev_epoch_id)
-            }
-            _ => Ok(false),
-        }
     }
 }
 
@@ -729,7 +713,7 @@ impl Handler<GetBlock> for ViewClientActorInner {
             .epoch_manager
             .get_block_producer(block.header().epoch_id(), block.header().height())
             .into_chain_error()?;
-        Ok(BlockView::from_author_block(block_author, block))
+        Ok(BlockView::from_author_block(block_author, &block))
     }
 }
 
@@ -753,7 +737,7 @@ impl Handler<GetBlockWithMerkleTree> for ViewClientActorInner {
 }
 
 fn get_chunk_from_block(
-    block: Block,
+    block: &Block,
     shard_id: ShardId,
     chain: &Chain,
 ) -> Result<ShardChunk, near_chain::Error> {
@@ -762,7 +746,7 @@ fn get_chunk_from_block(
     let shard_index = shard_layout.get_shard_index(shard_id)?;
     let chunk_header =
         block.chunks().get(shard_index).ok_or(near_chain::Error::InvalidShardId(shard_id))?.clone();
-    let chunk_hash = chunk_header.chunk_hash();
+    let chunk_hash = chunk_header.chunk_hash().clone();
     let chunk = chain.get_chunk(&chunk_hash)?;
     let res =
         ShardChunk::with_header(ShardChunk::clone(&chunk), chunk_header).ok_or_else(|| {
@@ -788,11 +772,11 @@ impl Handler<GetShardChunk> for ViewClientActorInner {
             }
             GetShardChunk::BlockHash(block_hash, shard_id) => {
                 let block = self.chain.get_block(&block_hash)?;
-                Ok(get_chunk_from_block(block, shard_id, &self.chain)?)
+                Ok(get_chunk_from_block(&block, shard_id, &self.chain)?)
             }
             GetShardChunk::Height(height, shard_id) => {
                 let block = self.chain.get_block_by_height(height)?;
-                Ok(get_chunk_from_block(block, shard_id, &self.chain)?)
+                Ok(get_chunk_from_block(&block, shard_id, &self.chain)?)
             }
         }
     }
@@ -812,11 +796,11 @@ impl Handler<GetChunk> for ViewClientActorInner {
             }
             GetChunk::BlockHash(block_hash, shard_id) => {
                 let block = self.chain.get_block(&block_hash)?;
-                get_chunk_from_block(block, shard_id, &self.chain)?
+                get_chunk_from_block(&block, shard_id, &self.chain)?
             }
             GetChunk::Height(height, shard_id) => {
                 let block = self.chain.get_block_by_height(height)?;
-                get_chunk_from_block(block, shard_id, &self.chain)?
+                get_chunk_from_block(&block, shard_id, &self.chain)?
             }
         };
 
@@ -845,8 +829,7 @@ impl Handler<TxStatus> for ViewClientActorInner {
         tracing::debug!(target: "client", ?msg);
         let _timer =
             metrics::VIEW_CLIENT_MESSAGE_TIME.with_label_values(&["TxStatus"]).start_timer();
-        let validator_signer = self.validator.get();
-        self.get_tx_status(msg.tx_hash, msg.signer_account_id, msg.fetch_receipt, &validator_signer)
+        self.get_tx_status(msg.tx_hash, msg.signer_account_id, msg.fetch_receipt)
     }
 }
 
@@ -1102,8 +1085,8 @@ impl Handler<GetExecutionOutcome> for ViewClientActorInner {
                         .chain
                         .get_block(&h)?
                         .chunks()
-                        .iter_deprecated()
-                        .map(|header| header.prev_outcome_root())
+                        .iter()
+                        .map(|header| *header.prev_outcome_root())
                         .collect::<Vec<_>>();
                     if target_shard_index >= outcome_roots.len() {
                         return Err(GetExecutionOutcomeError::InconsistentState {
@@ -1127,12 +1110,7 @@ impl Handler<GetExecutionOutcome> for ViewClientActorInner {
                     &head.epoch_id,
                 )
                 .into_chain_error()?;
-                if self.shard_tracker.cares_about_shard(
-                    self.validator.get().map(|v| v.validator_id().clone()).as_ref(),
-                    &head.last_block_hash,
-                    target_shard_id,
-                    true,
-                ) {
+                if self.shard_tracker.cares_about_shard(&head.last_block_hash, target_shard_id) {
                     Err(GetExecutionOutcomeError::UnknownTransactionOrReceipt {
                         transaction_or_receipt_id: id,
                     })
@@ -1192,7 +1170,9 @@ impl Handler<GetBlockProof> for ViewClientActorInner {
         let _timer =
             metrics::VIEW_CLIENT_MESSAGE_TIME.with_label_values(&["GetBlockProof"]).start_timer();
         let block_header = self.chain.get_block_header(&msg.block_hash)?;
+        let block_header = BlockHeader::clone(&block_header);
         let head_block_header = self.chain.get_block_header(&msg.head_block_hash)?;
+        let head_block_header = BlockHeader::clone(&head_block_header);
         self.chain.check_blocks_final_and_canonical(&[block_header.clone(), head_block_header])?;
         let block_header_lite = block_header.into();
         let proof = self.chain.compute_past_block_proof_in_merkle_tree_of_later_block(
@@ -1266,10 +1246,8 @@ impl Handler<TxStatusRequest> for ViewClientActorInner {
         let _timer =
             metrics::VIEW_CLIENT_MESSAGE_TIME.with_label_values(&["TxStatusRequest"]).start_timer();
         let TxStatusRequest { tx_hash, signer_account_id } = msg;
-        let validator_signer = self.validator.get();
-        if let Ok(Some(result)) = self
-            .get_tx_status(tx_hash, signer_account_id, false, &validator_signer)
-            .map(|s| s.execution_outcome)
+        if let Ok(Some(result)) =
+            self.get_tx_status(tx_hash, signer_account_id, false).map(|s| s.execution_outcome)
         {
             Some(Box::new(result.into_outcome()))
         } else {
@@ -1293,7 +1271,7 @@ impl Handler<TxStatusResponse> for ViewClientActorInner {
             .with_label_values(&["TxStatusResponse"])
             .start_timer();
         let tx_hash = tx_result.transaction_outcome.id;
-        let mut request_manager = self.request_manager.write().expect(POISONED_LOCK_ERR);
+        let mut request_manager = self.request_manager.write();
         if request_manager.tx_status_requests.pop(&tx_hash).is_some() {
             request_manager.tx_status_response.put(tx_hash, *tx_result);
         }
@@ -1302,18 +1280,18 @@ impl Handler<TxStatusResponse> for ViewClientActorInner {
 
 impl Handler<BlockRequest> for ViewClientActorInner {
     #[perf]
-    fn handle(&mut self, msg: BlockRequest) -> Option<Box<Block>> {
+    fn handle(&mut self, msg: BlockRequest) -> Option<Arc<Block>> {
         tracing::debug!(target: "client", ?msg);
         let _timer =
             metrics::VIEW_CLIENT_MESSAGE_TIME.with_label_values(&["BlockRequest"]).start_timer();
         let BlockRequest(hash) = msg;
-        if let Ok(block) = self.chain.get_block(&hash) { Some(Box::new(block)) } else { None }
+        if let Ok(block) = self.chain.get_block(&hash) { Some(block) } else { None }
     }
 }
 
 impl Handler<BlockHeadersRequest> for ViewClientActorInner {
     #[perf]
-    fn handle(&mut self, msg: BlockHeadersRequest) -> Option<Vec<BlockHeader>> {
+    fn handle(&mut self, msg: BlockHeadersRequest) -> Option<Vec<Arc<BlockHeader>>> {
         tracing::debug!(target: "client", ?msg);
         let _timer = metrics::VIEW_CLIENT_MESSAGE_TIME
             .with_label_values(&["BlockHeadersRequest"])
@@ -1373,24 +1351,23 @@ impl Handler<StateRequestHeader> for ViewClientActorInner {
                 let header = match header {
                     ShardStateSyncResponseHeader::V2(inner) => inner,
                     _ => {
-                        tracing::error!(target: "sync", ?sync_hash, ?shard_id, "Invalid state sync header format");
+                        tracing::error!(target: "sync", ?sync_hash, %shard_id, "Invalid state sync header format");
                         return None;
                     }
                 };
 
-                let can_generate = self.has_state_snapshot(&sync_hash, shard_id).is_ok();
                 ShardStateSyncResponse::V3(ShardStateSyncResponseV3 {
                     header: Some(header),
                     part: None,
-                    cached_parts: None,
-                    can_generate,
+                    cached_parts: None,  // Unused
+                    can_generate: false, // Unused
                 })
             }
             None => ShardStateSyncResponse::V3(ShardStateSyncResponseV3 {
                 header: None,
                 part: None,
-                cached_parts: None,
-                can_generate: false,
+                cached_parts: None,  // Unused
+                can_generate: false, // Unused
             }),
         };
         let info = StateResponseInfo::V2(Box::new(StateResponseInfoV2 {
@@ -1414,11 +1391,7 @@ impl Handler<StateRequestPart> for ViewClientActorInner {
             metrics::STATE_SYNC_REQUESTS_THROTTLED_TOTAL.inc();
             return None;
         }
-        if let Err(err) = self.has_state_snapshot(&sync_hash, shard_id) {
-            tracing::debug!(target: "sync", ?err, ?sync_hash, "Node doesn't have a matching state snapshot");
-            return None;
-        }
-        tracing::debug!(target: "sync", ?shard_id, ?sync_hash, ?part_id, "Computing state request part");
+        tracing::debug!(target: "sync", %shard_id, ?sync_hash, ?part_id, "Computing state request part");
         let part = match self.chain.check_sync_hash_validity(&sync_hash) {
             Ok(true) => {
                 let part = match self
@@ -1428,16 +1401,16 @@ impl Handler<StateRequestPart> for ViewClientActorInner {
                 {
                     Ok(part) => Some((part_id, part)),
                     Err(err) => {
-                        error!(target: "sync", ?err, ?sync_hash, ?shard_id, part_id, "Cannot build state part");
+                        error!(target: "sync", ?err, ?sync_hash, %shard_id, part_id, "Cannot build state part");
                         None
                     }
                 };
 
-                tracing::trace!(target: "sync", ?sync_hash, ?shard_id, part_id, "Finished computation for state request part");
+                tracing::trace!(target: "sync", ?sync_hash, %shard_id, part_id, "Finished computation for state request part");
                 part
             }
             Ok(false) => {
-                warn!(target: "sync", ?sync_hash, ?shard_id, "sync_hash didn't pass validation, possible malicious behavior");
+                warn!(target: "sync", ?sync_hash, %shard_id, "sync_hash didn't pass validation, possible malicious behavior");
                 // Do not respond, possible malicious behavior.
                 return None;
             }
@@ -1452,12 +1425,11 @@ impl Handler<StateRequestPart> for ViewClientActorInner {
                 None
             }
         };
-        let can_generate = part.is_some();
         let state_response = ShardStateSyncResponse::V3(ShardStateSyncResponseV3 {
             header: None,
             part,
-            cached_parts: None,
-            can_generate,
+            cached_parts: None,  // Unused
+            can_generate: false, // Unused
         });
         let info = StateResponseInfo::V2(Box::new(StateResponseInfoV2 {
             shard_id,

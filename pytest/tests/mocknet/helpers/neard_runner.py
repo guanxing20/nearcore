@@ -121,7 +121,7 @@ backup_id_pattern = re.compile(r'^[0-9a-zA-Z.][0-9a-zA-Z_\-.]+$')
 # Remove old files if all the logs are past __neard_logs_max_size__
 # The prerotate logic serves us in case neard_runner is not running for a while
 # and we end up with a file larger than the estimated size.
-# cspell:ignore prerotate copytruncate missingok notifempty dateext endscript
+# cspell:ignore prerotate copytruncate missingok notifempty dateext endscript delaycompress
 LOGROTATE_TEMPLATE = """__neard_logs_dir__/__neard_logs_file_name__ {
     su ubuntu ubuntu
     size __neard_logs_file_size__
@@ -130,6 +130,8 @@ LOGROTATE_TEMPLATE = """__neard_logs_dir__/__neard_logs_file_name__ {
     missingok
     notifempty
     dateext
+    compress
+    delaycompress
     dateformat -%Y-%m-%d-%H-%M-%S
     create 0644 ubuntu ubuntu
     prerotate
@@ -182,18 +184,25 @@ class NeardRunner:
         # is no need to block reading that when inside the update_binaries rpc for example
         self.lock = threading.Lock()
 
+    def _get_root_disk_size(self):
+        return psutil.disk_usage('/').total
+
     def _configure_neard_logs(self):
         try:
             os.mkdir(self.neard_logs_dir)
         except FileExistsError:
             pass
 
+        # Get the size of the root disk and leave 50G for the system
+        logs_max_size = self._get_root_disk_size() - 50 * 1024 * 1024 * 1024
+
         variables = {
             '__neard_logs_dir__': f'{self.neard_logs_dir}',
             '__neard_logs_file_name__': f'{self.neard_logs_file_name}',
-            '__neard_logs_file_size__': '100M',
-            '__neard_logs_max_file_count__': '900',
-            '__neard_logs_max_size__': '100000000000',  # 100G
+            '__neard_logs_file_size__': '200M',
+            # Set to 100k to disable log rotation based on file count.
+            '__neard_logs_max_file_count__': '100000',
+            '__neard_logs_max_size__': f'{logs_max_size}',
         }
         logrotate_config = LOGROTATE_TEMPLATE
         # Replace variables in the template
@@ -209,9 +218,10 @@ class NeardRunner:
             logging.error('The logrotate tool was not found on this system.')
 
     # Try to rotate the logs based on the policy defined here: self.logrotate_config_path.
-    def run_logrotate(self):
+    # If force is set to true, the logs will be rotated even if the file size is not reached.
+    def run_logrotate(self, force=False):
         run_logrotate_cmd = [
-            self.logrotate_binary_path, '-s',
+            self.logrotate_binary_path, '-f' if force else '', '-s',
             f'{self.neard_logs_dir}/.logrotate_status',
             self.logrotate_config_path
         ]
@@ -300,7 +310,6 @@ class NeardRunner:
     # if force is set to true all binaries will be downloaded, otherwise only the missing ones
     def download_binaries(self, force):
         binaries = self.parse_binaries_config()
-
         try:
             os.mkdir(self.home_path('binaries'))
         except FileExistsError:
@@ -320,13 +329,22 @@ class NeardRunner:
         for i in range(start_index, len(binaries)):
             b = binaries[i]
             logging.info(f'downloading binary from {b["url"]}')
-            with open(b['system_path'], 'wb') as f:
-                r = requests.get(b['url'], stream=True)
-                r.raise_for_status()
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            url = b['url']
+            if os.path.isfile(url):
+                binary_dst = b['system_path']
+                logging.info(f"linking the `neard` binary to {binary_dst}")
+                if os.path.exists(binary_dst):
+                    os.remove(binary_dst)
+                os.symlink(url, binary_dst)
+            else:
+                with open(b['system_path'], 'wb') as binary_dst:
+                    r = requests.get(b['url'], stream=True)
+                    r.raise_for_status()
+                    for chunk in r.iter_content(chunk_size=8192):
+                        binary_dst.write(chunk)
+                    logging.info(f'downloaded binary from {b["url"]}')
+
             os.chmod(b['system_path'], 0o755)
-            logging.info(f'downloaded binary from {b["url"]}')
 
             self.data['binaries'].append(b)
             if self.data['current_neard_path'] is None:
@@ -385,7 +403,9 @@ class NeardRunner:
         config['rpc']['addr'] = f'0.0.0.0:{rpc_port}'
         config['network']['addr'] = f'0.0.0.0:{protocol_port}'
         self.data['neard_addr'] = config['rpc']['addr']
-        config['tracked_shards_config'] = 'AllShards'
+        if 'tracked_shards_config' in config:
+            del config['tracked_shards_config']
+        config['tracked_shards'] = [0, 1, 2, 3]
         config['log_summary_style'] = 'plain'
         config['network']['skip_sync_wait'] = False
         if self.legacy_records:
@@ -398,11 +418,15 @@ class NeardRunner:
         with open(self.tmp_near_home_path('config.json'), 'w') as f:
             json.dump(config, f, indent=2)
 
-    def reset_starting_data_dir(self):
+    def remove_data_dir(self):
         try:
+            logging.info("removing the old directory")
             shutil.rmtree(self.target_near_home_path('data'))
         except FileNotFoundError:
-            pass
+            logging.info("no old directory to remove")
+
+    def reset_starting_data_dir(self):
+        self.remove_data_dir()
         if not self.legacy_records:
             cmd = [
                 self.data['binaries'][0]['system_path'],
@@ -522,6 +546,8 @@ class NeardRunner:
     def do_network_init(self,
                         validators,
                         boot_nodes,
+                        state_source="dump",
+                        patches_path=None,
                         epoch_length=1000,
                         num_seats=100,
                         new_chain_id=None,
@@ -567,6 +593,8 @@ class NeardRunner:
             with open(self.home_path('network_init.json'), 'w') as f:
                 json.dump(
                     {
+                        'state_source': state_source,
+                        'patches_path': patches_path,
                         'boot_nodes': boot_nodes,
                         'epoch_length': epoch_length,
                         'num_seats': num_seats,
@@ -761,7 +789,7 @@ class NeardRunner:
         with self.lock:
             env_file_path = self.home_path('.env')
             open(env_file_path, 'w').close()
-            print(f'File {env_file_path} has been successfully cleared.')
+            logging.info(f'File {env_file_path} has been successfully cleared.')
 
     def do_add_env(self, key_values):
         with self.lock:
@@ -923,6 +951,8 @@ class NeardRunner:
 
     # If this is a regular node, starts neard run. If it's a traffic generator, starts neard mirror run
     def start_neard(self, batch_interval_millis=None):
+        # Rotate the logs before starting neard
+        self.run_logrotate(force=True)
         out_path = os.path.join(self.neard_logs_dir, self.neard_logs_file_name)
         with open(out_path, 'ab') as out:
             if self.is_traffic_generator():
@@ -1053,6 +1083,39 @@ class NeardRunner:
         backup_data = {'backup_id': backup_id, 'description': description}
         self.set_state(TestState.MAKING_BACKUP, data=backup_data)
 
+    def deprecated_set_validators(self, network_init_params, new_chain_id):
+        cmd = [
+            self.data['binaries'][0]['system_path'],
+            'amend-genesis',
+            '--genesis-file-in',
+            self.setup_path('genesis.json'),
+            '--records-file-in',
+            self.setup_path('records.json'),
+            '--genesis-file-out',
+            self.target_near_home_path('genesis.json'),
+            '--records-file-out',
+            self.target_near_home_path('records.json'),
+            '--validators',
+            self.home_path('validators.json'),
+            '--chain-id',
+            new_chain_id if new_chain_id is not None else 'mocknet',
+            '--transaction-validity-period',
+            '10000',
+            '--epoch-length',
+            str(network_init_params['epoch_length']),
+            '--num-seats',
+            str(network_init_params['num_seats']),
+            '--protocol-reward-rate',
+            '1/10',
+        ]
+        if network_init_params['protocol_version'] is not None:
+            cmd.append('--protocol-version')
+            cmd.append(str(network_init_params['protocol_version']))
+
+        self.run_neard(cmd)
+        self.set_state(TestState.AMEND_GENESIS)
+        self.save_data()
+
     def network_init(self):
         # wait til we get a network_init RPC
         if not os.path.exists(self.home_path('validators.json')):
@@ -1075,66 +1138,51 @@ class NeardRunner:
 
         new_chain_id = n.get('new_chain_id')
 
-        if self.legacy_records:
-            cmd = [
-                self.data['binaries'][0]['system_path'],
-                'amend-genesis',
-                '--genesis-file-in',
-                self.setup_path('genesis.json'),
-                '--records-file-in',
-                self.setup_path('records.json'),
-                '--genesis-file-out',
-                self.target_near_home_path('genesis.json'),
-                '--records-file-out',
-                self.target_near_home_path('records.json'),
-                '--validators',
-                self.home_path('validators.json'),
-                '--chain-id',
-                new_chain_id if new_chain_id is not None else 'mocknet',
-                '--transaction-validity-period',
-                '10000',
-                '--epoch-length',
-                str(n['epoch_length']),
-                '--num-seats',
-                str(n['num_seats']),
-                '--protocol-reward-rate',
-                '1/10',
-            ]
-            if n['protocol_version'] is not None:
-                cmd.append('--protocol-version')
-                cmd.append(str(n['protocol_version']))
+        if self.legacy_records and n['state_source'] == 'dump':
+            self.deprecated_set_validators(n, new_chain_id)
+            return
 
-            self.run_neard(cmd)
-            self.set_state(TestState.AMEND_GENESIS)
-        else:
-            cmd = [
-                self.data['binaries'][0]['system_path'],
-                '--home',
-                self.target_near_home_path(),
-                'fork-network',
-                'set-validators',
-                '--validators',
-                self.home_path('validators.json'),
-                '--epoch-length',
-                str(n['epoch_length']),
-                '--genesis-time',
-                str(n['genesis_time']),
-                '--num-seats',
-                str(n['num_seats']),
-            ]
-            if new_chain_id is not None:
-                cmd.append('--chain-id')
-                cmd.append(new_chain_id)
-            else:
-                cmd.append('--chain-id-suffix')
-                cmd.append('_mocknet')
+        if n['state_source'] == 'empty':
+            self.remove_data_dir()
 
-            if n['protocol_version'] is not None:
-                cmd.append('--protocol-version')
-                cmd.append(str(n['protocol_version']))
+        cmd = [
+            self.data['binaries'][0]['system_path'],
+            '--home',
+            self.target_near_home_path(),
+            'fork-network',
+            'set-validators',
+            '--validators',
+            self.home_path('validators.json'),
+            '--epoch-length',
+            str(n['epoch_length']),
+            '--genesis-time',
+            n['genesis_time'],
+            '--num-seats',
+            str(n['num_seats']),
+        ]
 
-            self.run_neard(cmd)
-            self.set_state(TestState.SET_VALIDATORS)
+        # Needed for backwards compatibility. Works because 'dump' is the
+        # default option.
+        # TODO(2.8): After we stop testing neard binaries with version < 2.7.0,
+        # use the --state-source flag unconditionally.
+        if n['state_source'] != 'dump':
+            cmd.append('--state-source')
+            cmd.append(n['state_source'])
+
+        if n['patches_path'] is not None:
+            cmd.append('--patches-path')
+            cmd.append(n['patches_path'])
+
+        if new_chain_id is not None:
+            cmd.append('--chain-id')
+            cmd.append(new_chain_id)
+
+        if n['protocol_version'] is not None:
+            cmd.append('--protocol-version')
+            cmd.append(str(n['protocol_version']))
+
+        self.run_neard(cmd)
+        self.set_state(TestState.SET_VALIDATORS)
         self.save_data()
 
     def check_set_validators(self):
@@ -1345,11 +1393,7 @@ class NeardRunner:
             logging.error(f'backup dir {backup_path} does not exist')
             self.set_state(TestState.ERROR)
             self.save_data()
-        try:
-            logging.info("removing the old directory")
-            shutil.rmtree(self.target_near_home_path('data'))
-        except FileNotFoundError:
-            pass
+        self.remove_data_dir()
         self.run_restore_from_backup_cmd(backup_path)
         self.set_state(TestState.STOPPED)
         self.save_data()

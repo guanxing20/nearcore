@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use near_async::messaging::Handler as _;
 use near_async::time::Duration;
@@ -14,6 +14,7 @@ use near_o11y::testonly::init_test_logger;
 use near_primitives::hash::CryptoHash;
 use near_primitives::shard_layout::ShardLayout;
 use near_primitives::types::{AccountId, BlockId, BlockReference, EpochId, NumSeats};
+use parking_lot::RwLock;
 
 use crate::setup::builder::TestLoopBuilder;
 use crate::utils::ONE_NEAR;
@@ -157,7 +158,7 @@ impl Test {
         let height_to_epoch = Arc::new(RwLock::new(HashMap::new()));
 
         let check_heights = move |prev_hash: &CryptoHash, hash: &CryptoHash, height| {
-            let mut map = heights.write().unwrap();
+            let mut map = heights.write();
             // Note that height of the previous block is not guaranteed to be height
             // - 1.  All we know is that it’s less than height of the current block.
             if let Some(prev_height) = map.get(prev_hash) {
@@ -185,10 +186,10 @@ impl Test {
                     let h = block.header.height;
                     check_heights(&block.header.prev_hash, &block.header.hash, h);
 
-                    let mut height_to_hash = height_to_hash.write().unwrap();
+                    let mut height_to_hash = height_to_hash.write();
                     height_to_hash.insert(h, block.header.hash);
 
-                    let mut height_to_epoch = height_to_epoch.write().unwrap();
+                    let mut height_to_epoch = height_to_epoch.write();
                     height_to_epoch.insert(h, EpochId(block.header.epoch_id));
 
                     let block_producer = block.author;
@@ -273,7 +274,7 @@ impl Test {
 }
 
 #[test]
-fn slow_chunks_produced_and_distributed_all_in_all_shards() {
+fn slow_test_chunks_produced_and_distributed_all_in_all_shards() {
     Test {
         min_validators: 4,
         test4_config: Test4Config { drop_messages_from: &[], assert_missed_chunk: false },
@@ -364,7 +365,8 @@ fn slow_test_chunks_produced_and_distributed_chunk_distribution_network_incorrec
 }
 
 #[test]
-fn slow_chunks_produced_and_distributed_all_in_all_shards_should_succeed_even_without_forwarding() {
+fn slow_test_chunks_produced_and_distributed_all_in_all_shards_should_succeed_even_without_forwarding()
+ {
     Test {
         min_validators: 4,
         test4_config: Test4Config { drop_messages_from: &[], assert_missed_chunk: false },

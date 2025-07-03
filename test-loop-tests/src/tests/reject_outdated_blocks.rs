@@ -74,17 +74,19 @@ fn slow_test_reject_blocks_with_outdated_protocol_version() {
         .warmup();
 
     let client = &test_loop.data.get(&node_datas[0].client_sender.actor_handle()).client;
-    let tx_processor = &test_loop.data.get(&node_datas[0].tx_processor_sender.actor_handle());
+    let rpc_handler = &test_loop.data.get(&node_datas[0].rpc_handler_sender.actor_handle());
 
     let height = client.chain.head().unwrap().height;
     let latest_block = client.chain.get_block_by_height(height).unwrap();
     let tx = create_tx(&latest_block, &accounts[0], &accounts[1]);
-    let _ = tx_processor.process_tx(tx, false, false);
+    let _ = rpc_handler.process_tx(tx, false, false);
 
     // check if block is rejected due to the outdated version
     let client = &mut test_loop.data.get_mut(&node_datas[0].client_sender.actor_handle()).client;
     let mut old_version_block = client.produce_block(height + 1).unwrap().unwrap();
-    old_version_block.mut_header().set_latest_protocol_version(PROTOCOL_VERSION - 1);
+    std::sync::Arc::make_mut(&mut old_version_block)
+        .mut_header()
+        .set_latest_protocol_version(PROTOCOL_VERSION - 1);
     let res = client.process_block_test(old_version_block.clone().into(), Provenance::NONE);
     assert!(matches!(res, Err(Error::InvalidProtocolVersion)));
 

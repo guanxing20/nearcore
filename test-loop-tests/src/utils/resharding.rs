@@ -24,7 +24,7 @@ use near_primitives::views::{
     FinalExecutionStatus, QueryRequest, QueryResponse, QueryResponseKind,
 };
 use near_store::adapter::StoreAdapter;
-use near_store::adapter::trie_store::{TrieStoreAdapter, get_shard_uid_mapping};
+use near_store::adapter::trie_store::TrieStoreAdapter;
 use near_store::db::refcount::decode_value_with_rc;
 use near_store::trie::receipts_column_helper::{ShardsOutgoingReceiptBuffer, TrieQueue};
 use near_store::{DBCol, ShardUId, StorageError, Trie, TrieDBStorage, get};
@@ -45,6 +45,7 @@ use near_chain::types::Tip;
 use near_client::client_actor::ClientActorInner;
 use near_primitives::shard_layout::ShardLayout;
 use near_primitives::trie_key::TrieKey;
+use near_store::flat::FlatStorageStatus;
 use std::sync::Arc;
 
 /// A config to tell what shards will be tracked by the client at the given index.
@@ -775,42 +776,91 @@ fn retain_the_only_shard_state(client: &Client, the_only_shard_uid: ShardUId) {
 }
 
 /// Asserts that all other shards State except `the_only_shard_uid` have been cleaned-up.
-///
-/// `expect_shard_uid_is_mapped` means that `the_only_shard_uid` should use an ancestor
-/// ShardUId as the db key prefix.
-fn check_has_the_only_shard_state(
-    client: &Client,
-    the_only_shard_uid: ShardUId,
-    expect_shard_uid_is_mapped: bool,
-) {
-    let store = client.chain.chain_store.store().trie_store();
+fn check_has_the_only_shard_state(client: &Client, the_only_shard_uid: ShardUId) {
+    let store = client.chain.chain_store.store();
     let mut shard_uid_prefixes = HashSet::new();
-    for kv in store.store().iter_raw_bytes(DBCol::State) {
+    for kv in store.iter_raw_bytes(DBCol::State) {
         let (key, _) = kv.unwrap();
         let shard_uid = ShardUId::try_from_slice(&key[0..8]).unwrap();
         shard_uid_prefixes.insert(shard_uid);
     }
-    let mapped_shard_uid = get_shard_uid_mapping(&store.store(), the_only_shard_uid);
-    if expect_shard_uid_is_mapped {
-        assert_ne!(mapped_shard_uid, the_only_shard_uid);
-    } else {
-        assert_eq!(mapped_shard_uid, the_only_shard_uid);
-    };
-    let shard_uid_prefixes = shard_uid_prefixes.into_iter().collect_vec();
-    assert_eq!(shard_uid_prefixes, [mapped_shard_uid]);
+    assert_eq!(shard_uid_prefixes.into_iter().collect_vec(), [the_only_shard_uid]);
+}
+
+/// Loop action testing that resharding is skipped when no children are tracked.
+/// Verifies that parent shard flat storage remains Ready after resharding.
+pub(crate) fn check_resharding_skipped_when_no_children_tracked(
+    parent_shard_uid: ShardUId,
+    tracked_shard_schedule: TrackedShardSchedule,
+) -> LoopAction {
+    let client_index = tracked_shard_schedule.client_index;
+    let latest_height = Cell::new(0);
+    let resharding_height = Cell::new(None);
+    let checked = Cell::new(false);
+
+    let (done, succeeded) = LoopAction::shared_success_flag();
+    let action_fn = Box::new(
+        move |node_datas: &[NodeExecutionData], test_loop_data: &mut TestLoopData, _: AccountId| {
+            if done.get() || checked.get() {
+                return;
+            }
+
+            let client_handle = node_datas[client_index].client_sender.actor_handle();
+            let client = &test_loop_data.get_mut(&client_handle).client;
+            let tip = client.chain.head().unwrap();
+
+            // Run this action only once at every block height.
+            if latest_height.get() == tip.height {
+                return;
+            }
+            latest_height.set(tip.height);
+
+            if resharding_height.get().is_none() {
+                if next_block_has_new_shard_layout(client.epoch_manager.as_ref(), &tip) {
+                    resharding_height.set(Some(tip.height));
+                    tracing::debug!(target: "test", height=tip.height, "resharding height set");
+                }
+            }
+
+            // Check flat storage status after resharding.
+            if let Some(resharding_h) = resharding_height.get() {
+                if tip.height > resharding_h + 3 && !checked.get() {
+                    let flat_store = client.runtime_adapter.store().flat_store();
+                    let status = flat_store.get_flat_storage_status(parent_shard_uid);
+
+                    match status {
+                        Ok(FlatStorageStatus::Ready(_)) => {
+                            // Flat storage should be Ready.
+                        }
+                        Ok(status) => {
+                            panic!(
+                                "Unexpected parent shard status {:?} for shard {:?}",
+                                status, parent_shard_uid
+                            );
+                        }
+                        Err(e) => {
+                            panic!(
+                                "Error checking parent shard {:?} flat storage status: {:?}",
+                                parent_shard_uid, e
+                            );
+                        }
+                    }
+                    checked.set(true);
+                    done.set(true);
+                }
+            }
+        },
+    );
+    LoopAction::new(action_fn, succeeded)
 }
 
 /// Loop action testing state cleanup.
 /// It assumes single shard tracking and it waits for `num_epochs_to_wait`.
 /// Then it checks whether the last shard tracked by the client
 /// is the only ShardUId prefix for nodes in the State column.
-///
-/// Pass `expect_shard_uid_is_mapped` as true if it is expected at the end of the test
-/// that the last tracked shard will use an ancestor ShardUId as a db key prefix.
 pub(crate) fn check_state_cleanup(
     tracked_shard_schedule: TrackedShardSchedule,
     num_epochs_to_wait: u64,
-    expect_shard_uid_is_mapped: bool,
 ) -> LoopAction {
     let client_index = tracked_shard_schedule.client_index;
     let latest_height = Cell::new(0);
@@ -853,7 +903,7 @@ pub(crate) fn check_state_cleanup(
                 return;
             }
             // At this point, we should only have State from the last tracked shard.
-            check_has_the_only_shard_state(&client, tracked_shard_uid, expect_shard_uid_is_mapped);
+            check_has_the_only_shard_state(&client, tracked_shard_uid);
             done.set(true);
         },
     );
@@ -1170,7 +1220,7 @@ pub(crate) fn delayed_receipts_repro_missing_trie_value(
                 // been executed correctly.
                 (Some(resharding), latest) if latest == resharding + 5 + 5 => {
                     let txs = txs.take();
-                    for (tx, tx_height) in txs.iter() {
+                    for (tx, tx_height) in &txs {
                         let tx_outcome =
                             client_actor.client.chain.get_partial_transaction_result(&tx);
                         let status = tx_outcome.as_ref().map(|o| o.status.clone());

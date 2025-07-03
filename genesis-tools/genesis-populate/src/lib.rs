@@ -11,6 +11,7 @@ use near_chain_configs::Genesis;
 use near_crypto::InMemorySigner;
 use near_epoch_manager::{EpochManager, EpochManagerAdapter, EpochManagerHandle};
 use near_primitives::account::{AccessKey, Account, AccountContract};
+use near_primitives::bandwidth_scheduler::BandwidthRequests;
 use near_primitives::block::Tip;
 use near_primitives::congestion_info::CongestionInfo;
 use near_primitives::epoch_block_info::BlockInfo;
@@ -219,7 +220,7 @@ impl GenesisBuilder {
         Ok(())
     }
 
-    fn write_genesis_block(&mut self) -> Result<()> {
+    fn write_genesis_block(&self) -> Result<()> {
         let shard_ids: Vec<_> = self.genesis.config.shard_layout.shard_ids().collect();
 
         let state_roots = self.roots.values().cloned().collect();
@@ -268,32 +269,27 @@ impl GenesisBuilder {
         store_update
             .save_block_header(genesis.header().clone())
             .expect("save genesis block header shouldn't fail");
-        store_update.save_block(genesis.clone());
+        let genesis = Arc::new(genesis);
+        store_update.save_block(Arc::clone(&genesis));
 
-        for (chunk_header, &state_root) in
-            genesis.chunks().iter_deprecated().zip(self.roots.values())
-        {
+        for (chunk_header, &state_root) in genesis.chunks().iter().zip(self.roots.values()) {
             let shard_layout = &self.genesis.config.shard_layout;
             let shard_id = chunk_header.shard_id();
             let shard_uid = ShardUId::from_shard_id_and_layout(shard_id, &shard_layout);
 
             let congestion_info = self.get_congestion_info(&genesis, shard_id, state_root)?;
 
-            store_update.save_chunk_extra(
-                genesis.hash(),
-                &shard_uid,
-                ChunkExtra::new(
-                    self.genesis.config.protocol_version,
-                    &state_root,
-                    CryptoHash::default(),
-                    vec![],
-                    0,
-                    self.genesis.config.gas_limit,
-                    0,
-                    Some(congestion_info),
-                    chunk_header.bandwidth_requests().cloned(),
-                ),
+            let chunk_extra = ChunkExtra::new(
+                &state_root,
+                CryptoHash::default(),
+                vec![],
+                0,
+                self.genesis.config.gas_limit,
+                0,
+                Some(congestion_info),
+                chunk_header.bandwidth_requests().cloned().unwrap_or_else(BandwidthRequests::empty),
             );
+            store_update.save_chunk_extra(genesis.hash(), &shard_uid, chunk_extra.into());
         }
 
         let head = Tip::from_header(genesis.header());

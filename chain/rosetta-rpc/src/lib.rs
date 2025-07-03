@@ -14,8 +14,9 @@ use strum::IntoEnumIterator;
 
 pub use config::RosettaRpcConfig;
 use near_chain_configs::Genesis;
-use near_client::{ClientActor, TxRequestHandlerActor, ViewClientActor};
+use near_client::{ClientActor, RpcHandlerActor, ViewClientActor};
 use near_o11y::WithSpanContextExt;
+use near_o11y::span_wrapped_msg::SpanWrappedMessageExt;
 use near_primitives::{account::AccountContract, borsh::BorshDeserialize};
 
 mod adapters;
@@ -56,7 +57,11 @@ async fn check_network_identifier(
     }
 
     let status = client_addr
-        .send(near_client::Status { is_health_check: false, detailed: false }.with_span_context())
+        .send(
+            near_client::Status { is_health_check: false, detailed: false }
+                .span_wrap()
+                .with_span_context(),
+        )
         .await?
         .map_err(|err| errors::ErrorKind::InternalError(err.to_string()))?;
     if status.chain_id != identifier.network {
@@ -79,7 +84,11 @@ async fn network_list(
     _body: Json<models::MetadataRequest>,
 ) -> Result<Json<models::NetworkListResponse>, models::Error> {
     let status = client_addr
-        .send(near_client::Status { is_health_check: false, detailed: false }.with_span_context())
+        .send(
+            near_client::Status { is_health_check: false, detailed: false }
+                .span_wrap()
+                .with_span_context(),
+        )
         .await?
         .map_err(|err| errors::ErrorKind::InternalError(err.to_string()))?;
     Ok(Json(models::NetworkListResponse {
@@ -107,7 +116,7 @@ async fn network_status(
     let status = check_network_identifier(&client_addr, network_identifier).await?;
 
     let (network_info, earliest_block) = tokio::try_join!(
-        client_addr.send(near_client::GetNetworkInfo {}.with_span_context()),
+        client_addr.send(near_client::GetNetworkInfo {}.span_wrap().with_span_context()),
         view_client_addr.send(
             near_client::GetBlock(near_primitives::types::BlockReference::SyncCheckpoint(
                 near_primitives::types::SyncCheckpoint::EarliestAvailable
@@ -783,7 +792,7 @@ async fn construction_hash(
 /// mempool. Otherwise, it should return an error.
 async fn construction_submit(
     client_addr: web::Data<Addr<ClientActor>>,
-    tx_handler_addr: web::Data<Addr<TxRequestHandlerActor>>,
+    tx_handler_addr: web::Data<Addr<RpcHandlerActor>>,
     body: Json<models::ConstructionSubmitRequest>,
 ) -> Result<Json<models::TransactionIdentifierResponse>, models::Error> {
     let Json(models::ConstructionSubmitRequest { network_identifier, signed_transaction }) = body;
@@ -842,7 +851,7 @@ pub fn start_rosetta_rpc(
     genesis_block_hash: &near_primitives::hash::CryptoHash,
     client_addr: Addr<ClientActor>,
     view_client_addr: Addr<ViewClientActor>,
-    tx_handler_addr: Addr<TxRequestHandlerActor>,
+    tx_handler_addr: Addr<RpcHandlerActor>,
 ) -> actix_web::dev::ServerHandle {
     let crate::config::RosettaRpcConfig { addr, cors_allowed_origins, limits, currencies } = config;
     let block_id = models::BlockIdentifier::new(genesis.config.genesis_height, genesis_block_hash);

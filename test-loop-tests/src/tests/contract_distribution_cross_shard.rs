@@ -53,7 +53,7 @@ fn test_contract_distribution_cross_shard() {
     // Next, clear the compiled contract cache and repeat the same contract calls.
     let contracts = deploy_contracts(&mut env, &rpc_id, &contract_ids, &mut nonce);
 
-    for contract in contracts.into_iter() {
+    for contract in contracts {
         run_until_caches_contain_contract(&mut env, contract.hash());
     }
 
@@ -83,7 +83,8 @@ fn setup(accounts: &Vec<AccountId>) -> (TestLoopEnv, AccountId) {
     let clients = accounts.iter().take(NUM_VALIDATORS + NUM_RPC).cloned().collect_vec();
     let rpc_id = accounts[NUM_VALIDATORS].clone();
 
-    let shard_layout = ShardLayout::simple_v1(&["account4"]);
+    let boundary_accounts = ["account4"].iter().map(|a| a.parse().unwrap()).collect();
+    let shard_layout = ShardLayout::multi_shard_custom(boundary_accounts, 1);
     let validators_spec =
         ValidatorsSpec::desired_roles(&block_and_chunk_producers, &chunk_validators_only);
 
@@ -151,8 +152,8 @@ fn call_contracts(
 ) {
     let method_name = "main".to_owned();
     let mut txs = vec![];
-    for sender_id in sender_ids.into_iter() {
-        for contract_id in contract_ids.into_iter() {
+    for sender_id in sender_ids {
+        for contract_id in contract_ids {
             tracing::info!(target: "test", ?rpc_id, ?sender_id, ?contract_id, "Calling contract.");
             let tx = call_contract(
                 &mut env.test_loop,

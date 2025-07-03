@@ -86,15 +86,8 @@ pub(crate) fn execute_function_call(
         output_data_receivers,
     };
 
-    // Enable caching chunk mode for the function call. This allows to charge for nodes touched in a chunk only once for
-    // the first access time. Although nodes are accessed for other actions as well, we do it only here because we
-    // charge only for trie nodes touched during function calls.
-    // TODO (#5920): Consider using RAII for switching the state back
-
     near_vm_runner::reset_metrics();
-    let mode_guard = runtime_ext.trie_update.with_trie_cache();
     let result = near_vm_runner::run(contract, runtime_ext, &context, Arc::clone(&config.fees));
-    drop(mode_guard);
     near_vm_runner::report_metrics(
         &apply_state.shard_id.to_string(),
         &apply_state.apply_reason.to_string(),
@@ -192,11 +185,11 @@ pub(crate) fn action_function_call(
         account.clone(),
         *action_hash,
         apply_state.epoch_id,
-        apply_state.block_hash,
         apply_state.block_height,
         epoch_info_provider,
         apply_state.current_protocol_version,
         config.wasm_config.storage_get_mode,
+        Arc::clone(&apply_state.trie_access_tracker_state),
     );
     let outcome = execute_function_call(
         contract,
@@ -669,7 +662,7 @@ fn get_code_len_or_default(
 
 /// Clears the contract storage usage based on type for an account.
 pub(crate) fn clear_account_contract_storage_usage(
-    state_update: &mut TrieUpdate,
+    state_update: &TrieUpdate,
     account_id: &AccountId,
     account: &mut Account,
     current_protocol_version: ProtocolVersion,
@@ -1107,10 +1100,7 @@ fn check_transfer_to_nonexisting_account(
 
 /// See #11703 for more details
 #[cfg(feature = "test_features")]
-fn apply_recorded_storage_garbage(
-    function_call: &FunctionCallAction,
-    state_update: &mut TrieUpdate,
-) {
+fn apply_recorded_storage_garbage(function_call: &FunctionCallAction, state_update: &TrieUpdate) {
     if let Some(garbage_size_mbs) = function_call
         .method_name
         .strip_prefix("internal_record_storage_garbage_")
@@ -1382,7 +1372,6 @@ mod tests {
             apply_reason: ApplyChunkReason::UpdateTrackedShard,
             block_height,
             prev_block_hash: CryptoHash::default(),
-            block_hash: CryptoHash::default(),
             shard_id: ShardUId::single_shard().shard_id(),
             epoch_id: EpochId::default(),
             epoch_height: 3,
@@ -1396,6 +1385,7 @@ mod tests {
             is_new_chunk: false,
             congestion_info: BlockCongestionInfo::default(),
             bandwidth_requests: BlockBandwidthRequests::empty(),
+            trie_access_tracker_state: Default::default(),
         }
     }
 

@@ -1,14 +1,12 @@
 pub(super) mod opener;
 
-use std::io;
-use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
-
-use opener::StoreOpener;
-
 use crate::config::ArchivalConfig;
 use crate::db::{Database, SplitDB, metadata};
 use crate::{Store, StoreConfig};
+use opener::StoreOpener;
+use std::io;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
 
 /// Specifies temperature of a storage.
 ///
@@ -55,6 +53,21 @@ impl NodeStorage {
         StoreOpener::new(home_dir, store_config, archival_config)
     }
 
+    /// Initializes an opener for a new temporary test store.
+    ///
+    /// As per the name, this is meant for tests only.  The created store will
+    /// use test configuration (which may differ slightly from default config).
+    /// The function **panics** if a temporary directory cannot be created.
+    ///
+    /// Note that the caller must hold the temporary directory returned as first
+    /// element of the tuple while the store is open.
+    pub fn test_opener() -> (tempfile::TempDir, StoreOpener<'static>) {
+        static CONFIG: LazyLock<StoreConfig> = LazyLock::new(StoreConfig::test_config);
+        let dir = tempfile::tempdir().unwrap();
+        let opener = NodeStorage::opener(dir.path(), &CONFIG, None);
+        (dir, opener)
+    }
+
     /// Constructs new object backed by given database.
     fn from_rocksdb(
         hot_storage: crate::db::RocksDB,
@@ -70,21 +83,6 @@ impl NodeStorage {
         };
 
         Self { hot_storage, cold_storage: cold_db }
-    }
-
-    /// Initializes an opener for a new temporary test store.
-    ///
-    /// As per the name, this is meant for tests only.  The created store will
-    /// use test configuration (which may differ slightly from default config).
-    /// The function **panics** if a temporary directory cannot be created.
-    ///
-    /// Note that the caller must hold the temporary directory returned as first
-    /// element of the tuple while the store is open.
-    pub fn test_opener() -> (tempfile::TempDir, StoreOpener<'static>) {
-        static CONFIG: LazyLock<StoreConfig> = LazyLock::new(StoreConfig::test_config);
-        let dir = tempfile::tempdir().unwrap();
-        let opener = NodeStorage::opener(dir.path(), &CONFIG, None);
-        (dir, opener)
     }
 
     /// Constructs new object backed by given database.
@@ -116,7 +114,7 @@ impl NodeStorage {
     /// store, the view client should use the split store and the cold store
     /// loop should use cold store.
     pub fn get_hot_store(&self) -> Store {
-        Store { storage: self.hot_storage.clone() }
+        Store::new(self.hot_storage.clone())
     }
 
     /// Returns the cold store. The cold store is only available in archival
@@ -128,7 +126,7 @@ impl NodeStorage {
     /// loop should use cold store.
     pub fn get_cold_store(&self) -> Option<Store> {
         match &self.cold_storage {
-            Some(cold_storage) => Some(Store { storage: cold_storage.clone() }),
+            Some(cold_storage) => Some(Store::new(cold_storage.clone())),
             None => None,
         }
     }
@@ -140,7 +138,7 @@ impl NodeStorage {
     pub fn get_recovery_store(&self) -> Option<Store> {
         match &self.cold_storage {
             Some(cold_storage) => {
-                Some(Store { storage: Arc::new(crate::db::RecoveryDB::new(cold_storage.clone())) })
+                Some(Store::new(Arc::new(crate::db::RecoveryDB::new(cold_storage.clone()))))
             }
             None => None,
         }
@@ -154,7 +152,7 @@ impl NodeStorage {
     /// store, the view client should use the split store and the cold store
     /// loop should use cold store.
     pub fn get_split_store(&self) -> Option<Store> {
-        self.get_split_db().map(|split_db| Store { storage: split_db })
+        self.get_split_db().map(|split_db| Store::new(split_db))
     }
 
     pub fn get_split_db(&self) -> Option<Arc<SplitDB>> {

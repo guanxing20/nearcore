@@ -1,8 +1,7 @@
 use crate::adapter::trie_store::TrieStoreAdapter;
-use crate::trie::POISONED_LOCK_ERR;
 use crate::trie::config::TrieConfig;
 use crate::trie::prefetching_trie_storage::PrefetcherResult;
-use crate::{MissingTrieValueContext, PrefetchApi, StorageError, metrics};
+use crate::{MissingTrieValue, MissingTrieValueContext, PrefetchApi, StorageError, metrics};
 use lru::LruCache;
 use near_o11y::log_assert;
 use near_o11y::metrics::prometheus;
@@ -11,9 +10,10 @@ use near_primitives::hash::CryptoHash;
 use near_primitives::shard_layout::ShardUId;
 use near_primitives::state::PartialState;
 use near_primitives::types::ShardId;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub(crate) struct BoundedQueue<T> {
     queue: VecDeque<T>,
@@ -284,8 +284,8 @@ impl TrieCache {
         }
     }
 
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<TrieCacheInner> {
-        self.0.lock().expect(POISONED_LOCK_ERR)
+    pub(crate) fn lock(&self) -> MutexGuard<TrieCacheInner> {
+        self.0.lock()
     }
 }
 
@@ -314,20 +314,20 @@ pub trait TrieStorage: Send + Sync {
 #[derive(Default)]
 pub struct TrieMemoryPartialStorage {
     pub(crate) recorded_storage: HashMap<CryptoHash, Arc<[u8]>>,
-    pub(crate) visited_nodes: std::sync::RwLock<HashSet<CryptoHash>>,
+    pub(crate) visited_nodes: RwLock<HashSet<CryptoHash>>,
 }
 
 impl TrieStorage for TrieMemoryPartialStorage {
     fn retrieve_raw_bytes(&self, hash: &CryptoHash) -> Result<Arc<[u8]>, StorageError> {
         if let Some(value) = self.recorded_storage.get(hash).cloned() {
-            self.visited_nodes.write().expect("write visited_nodes").insert(*hash);
+            self.visited_nodes.write().insert(*hash);
             Ok(value)
         } else {
             metrics::TRIE_MEMORY_PARTIAL_STORAGE_MISSING_VALUES_COUNT.inc();
-            Err(StorageError::MissingTrieValue(
-                MissingTrieValueContext::TrieMemoryPartialStorage,
-                *hash,
-            ))
+            Err(StorageError::MissingTrieValue(MissingTrieValue {
+                context: MissingTrieValueContext::TrieMemoryPartialStorage,
+                hash: *hash,
+            }))
         }
     }
 
@@ -342,7 +342,7 @@ impl TrieMemoryPartialStorage {
     }
 
     pub fn partial_state(&self) -> PartialState {
-        let touched_nodes = self.visited_nodes.read().expect("read visited_nodes");
+        let touched_nodes = self.visited_nodes.read();
         let mut nodes: Vec<_> =
             self.recorded_storage
                 .iter()
@@ -365,7 +365,7 @@ impl TrieMemoryPartialStorage {
 pub struct TrieCachingStorage {
     pub(crate) store: TrieStoreAdapter,
     pub(crate) shard_uid: ShardUId,
-    pub(crate) is_view: bool,
+    pub(crate) _is_view: bool,
 
     /// Caches ever requested items for the shard `shard_uid`. Used to speed up DB operations, presence of any item is
     /// not guaranteed.
@@ -423,7 +423,14 @@ impl TrieCachingStorage {
             prefetch_retry: metrics::PREFETCH_RETRY.with_label_values(&metrics_labels[..1]),
             prefetch_conflict: metrics::PREFETCH_CONFLICT.with_label_values(&metrics_labels[..1]),
         };
-        TrieCachingStorage { store, shard_uid, is_view, shard_cache, prefetch_api, metrics }
+        TrieCachingStorage {
+            store,
+            shard_uid,
+            _is_view: is_view,
+            shard_cache,
+            prefetch_api,
+            metrics,
+        }
     }
 
     /// Reads value if it is not in shard cache. Handles dropping the cache
@@ -431,7 +438,7 @@ impl TrieCachingStorage {
     /// It is responsibility of caller to release the prefetch slot later.
     fn read_for_shard_cache_miss(
         &self,
-        guard: std::sync::MutexGuard<TrieCacheInner>,
+        guard: MutexGuard<TrieCacheInner>,
         hash: &CryptoHash,
     ) -> Result<Arc<[u8]>, StorageError> {
         let Some(prefetcher) = &self.prefetch_api else {

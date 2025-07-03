@@ -10,7 +10,6 @@ use near_primitives::receipt::Receipt;
 use near_primitives::sandbox::state_patch::SandboxStatePatch;
 use near_primitives::shard_layout::ShardUId;
 use near_primitives::sharding::ShardChunkHeader;
-use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::Gas;
 use near_primitives::types::chunk_extra::ChunkExtra;
 use node_runtime::SignedValidPeriodTransactions;
@@ -43,8 +42,7 @@ pub enum ShardUpdateResult {
 
 pub struct NewChunkData {
     pub chunk_header: ShardChunkHeader,
-    pub transactions: Vec<SignedTransaction>,
-    pub transaction_validity_check_results: Vec<bool>,
+    pub transactions: SignedValidPeriodTransactions,
     pub receipts: Vec<Receipt>,
     pub block: ApplyChunkBlockContext,
     pub storage_context: StorageContext,
@@ -69,6 +67,7 @@ pub enum ShardUpdateReason {
 }
 
 /// Information about shard to update.
+#[derive(Debug, Clone)]
 pub struct ShardContext {
     pub shard_uid: ShardUId,
     /// Whether transactions should be applied.
@@ -117,21 +116,18 @@ pub fn apply_new_chunk(
     shard_context: ShardContext,
     runtime: &dyn RuntimeAdapter,
 ) -> Result<NewChunkResult, Error> {
-    let NewChunkData {
-        chunk_header,
-        transactions,
-        transaction_validity_check_results,
-        block,
-        receipts,
-        storage_context,
-    } = data;
+    let NewChunkData { chunk_header, transactions, block, receipts, storage_context } = data;
     let shard_id = shard_context.shard_uid.shard_id();
     let _span = tracing::debug_span!(
         target: "chain",
         parent: parent_span,
         "apply_new_chunk",
-        ?shard_id,
-        ?apply_reason)
+        height = block.height,
+        %shard_id,
+        chunk_hash = ?chunk_header.chunk_hash(),
+        block_type = ?block.block_type,
+        ?apply_reason,
+        tag_block_production = true)
     .entered();
     let gas_limit = chunk_header.gas_limit();
 
@@ -153,7 +149,7 @@ pub fn apply_new_chunk(
         },
         block,
         &receipts,
-        SignedValidPeriodTransactions::new(transactions, transaction_validity_check_results),
+        transactions,
     ) {
         Ok(apply_result) => {
             Ok(NewChunkResult { gas_limit, shard_uid: shard_context.shard_uid, apply_result })
@@ -178,8 +174,11 @@ pub fn apply_old_chunk(
         target: "chain",
         parent: parent_span,
         "apply_old_chunk",
-        ?shard_id,
-        ?apply_reason)
+        height = block.height,
+        %shard_id,
+        block_type = ?block.block_type,
+        ?apply_reason,
+        tag_block_production = true)
     .entered();
 
     let storage_config = RuntimeStorageConfig {

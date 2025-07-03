@@ -35,10 +35,12 @@ use near_crypto::{InMemorySigner, KeyFile, KeyType, PublicKey, Signer};
 use near_epoch_manager::EpochManagerHandle;
 #[cfg(feature = "json_rpc")]
 use near_jsonrpc::RpcConfig;
+use near_network::PeerAddr;
 use near_network::config::NetworkConfig;
 use near_network::tcp;
 use near_o11y::log_config::LogConfig;
 use near_primitives::hash::CryptoHash;
+use near_primitives::network::PeerId;
 use near_primitives::shard_layout::ShardLayout;
 use near_primitives::test_utils::create_test_signer;
 use near_primitives::types::{
@@ -60,6 +62,7 @@ use num_rational::Rational32;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -68,20 +71,20 @@ use tracing::{info, warn};
 pub const MILLI_NEAR: Balance = NEAR_BASE / 1000;
 
 /// Block production tracking delay.
-pub const BLOCK_PRODUCTION_TRACKING_DELAY: i64 = 100;
+pub const BLOCK_PRODUCTION_TRACKING_DELAY: i64 = 10;
 
 /// Mainnet and testnet validators are configured with a different value due to
 /// performance values.
-pub const MAINNET_MIN_BLOCK_PRODUCTION_DELAY: i64 = 1_300;
-pub const TESTNET_MIN_BLOCK_PRODUCTION_DELAY: i64 = 1_000;
+pub const MAINNET_MIN_BLOCK_PRODUCTION_DELAY: i64 = 0_600;
+pub const TESTNET_MIN_BLOCK_PRODUCTION_DELAY: i64 = 0_600;
 
 /// Maximum time to delay block production without approvals is ms.
 pub const MAX_BLOCK_PRODUCTION_DELAY: i64 = 2_000;
 
 /// Mainnet and testnet validators are configured with a different value due to
 /// performance values.
-pub const MAINNET_MAX_BLOCK_PRODUCTION_DELAY: i64 = 3_000;
-pub const TESTNET_MAX_BLOCK_PRODUCTION_DELAY: i64 = 2_500;
+pub const MAINNET_MAX_BLOCK_PRODUCTION_DELAY: i64 = 1_800;
+pub const TESTNET_MAX_BLOCK_PRODUCTION_DELAY: i64 = 1_800;
 
 /// Maximum time until skipping the previous block is ms.
 pub const MAX_BLOCK_WAIT_DELAY: i64 = 6_000;
@@ -116,7 +119,7 @@ pub const NETWORK_LEGACY_TELEMETRY_URL: &str = "https://explorer.{}.near.org/api
 pub const NETWORK_TELEMETRY_URL: &str = "https://telemetry.nearone.org/nodes";
 
 fn default_doomslug_step_period() -> Duration {
-    Duration::milliseconds(100)
+    Duration::milliseconds(10)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -245,7 +248,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rosetta_rpc: Option<RosettaRpcConfig>,
     #[cfg(feature = "tx_generator")]
-    pub tx_generator: Option<near_transactions_generator::TxGeneratorConfig>,
+    pub tx_generator: Option<near_transactions_generator::Config>,
     pub telemetry: TelemetryConfig,
     pub network: near_network::config_json::Config,
     pub consensus: Consensus,
@@ -280,6 +283,15 @@ pub struct Config {
     /// needs trie changes in order to do garbage collection on hot and populate cold State column.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_trie_changes: Option<bool>,
+    /// Whether to persist `ExecutionOutcomeWithProof` objects into
+    /// `DBCol::TransactionResultForBlock`.  Disabling this on validator
+    /// nodes reduces write amplification.  RPC nodes keep it enabled so
+    /// that transaction status queries continue to work.
+    /// If set to `None`, the value will be treated as true if either
+    /// - `archive` is true, or
+    /// - All shards are tracked (i.e. node is an RPC node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_tx_outcomes: Option<bool>,
     pub log_summary_style: LogSummaryStyle,
     #[serde(with = "near_async::time::serde_duration_as_std")]
     pub log_summary_period: Duration,
@@ -361,10 +373,12 @@ pub struct Config {
     pub max_loaded_contracts: usize,
     /// Save observed instances of ChunkStateWitness to the database in DBCol::LatestChunkStateWitnesses.
     /// Saving the latest witnesses is useful for analysis and debugging.
-    /// When this option is enabled, the node will save ALL witnesses it observes, even invalid ones,
-    /// which can cause extra load on the database. This option is not recommended for production use,
-    /// as a large number of incoming witnesses could cause denial of service.
+    /// This option can cause extra load on the database and is not recommended for production use.
     pub save_latest_witnesses: bool,
+    /// Save observed instances of invalid ChunkStateWitness to the database in DBCol::InvalidChunkStateWitnesses.
+    /// Saving invalid witnesses is useful for analysis and debugging.
+    /// This option can cause extra load on the database and is not recommended for production use.
+    pub save_invalid_witnesses: bool,
     pub transaction_request_handler_threads: usize,
 }
 
@@ -394,6 +408,7 @@ impl Default for Config {
             tracked_shard_schedule: None,
             archive: false,
             save_trie_changes: None,
+            save_tx_outcomes: None,
             log_summary_style: LogSummaryStyle::Colored,
             log_summary_period: default_log_summary_period(),
             gc: GCConfig::default(),
@@ -420,6 +435,7 @@ impl Default for Config {
             orphan_state_witness_max_size: default_orphan_state_witness_max_size(),
             max_loaded_contracts: 256,
             save_latest_witnesses: false,
+            save_invalid_witnesses: false,
             transaction_request_handler_threads: 4,
         }
     }
@@ -523,7 +539,7 @@ pub struct NearConfig {
     pub config: Config,
     pub client_config: ClientConfig,
     #[cfg(feature = "tx_generator")]
-    pub tx_generator: Option<near_transactions_generator::TxGeneratorConfig>,
+    pub tx_generator: Option<near_transactions_generator::Config>,
     pub network_config: NetworkConfig,
     #[cfg(feature = "json_rpc")]
     pub rpc_config: Option<RpcConfig>,
@@ -589,6 +605,10 @@ impl NearConfig {
                 tracked_shards_config: config.tracked_shards_config(),
                 archive: config.archive,
                 save_trie_changes: config.save_trie_changes.unwrap_or(!config.archive),
+                save_tx_outcomes: config.save_tx_outcomes.unwrap_or_else(|| {
+                    config.archive
+                        || config.tracked_shards_config() == TrackedShardsConfig::AllShards
+                }),
                 log_summary_style: config.log_summary_style,
                 gc: config.gc,
                 view_client_threads: config.view_client_threads,
@@ -615,6 +635,7 @@ impl NearConfig {
                 orphan_state_witness_pool_size: config.orphan_state_witness_pool_size,
                 orphan_state_witness_max_size: config.orphan_state_witness_max_size,
                 save_latest_witnesses: config.save_latest_witnesses,
+                save_invalid_witnesses: config.save_invalid_witnesses,
                 transaction_request_handler_threads: config.transaction_request_handler_threads,
             },
             #[cfg(feature = "tx_generator")]
@@ -833,10 +854,7 @@ pub fn init_configs(
     fs::create_dir_all(dir).with_context(|| anyhow!("Failed to create directory {:?}", dir))?;
 
     assert_ne!(chain_id, Some("".to_string()));
-    let chain_id = match chain_id {
-        Some(chain_id) => chain_id,
-        None => random_chain_id(),
-    };
+    let chain_id = chain_id.unwrap_or_else(random_chain_id);
 
     // Check if config already exists in home dir.
     if dir.join(CONFIG_FILENAME).exists() {
@@ -1086,20 +1104,22 @@ pub fn create_localnet_configs_from_seeds(
     );
     let validator_signers =
         seeds.iter().map(|seed| create_test_signer(seed.as_str())).collect::<Vec<_>>();
+
     let network_signers = seeds
         .iter()
         .map(|seed| InMemorySigner::from_seed("node".parse().unwrap(), KeyType::ED25519, seed))
         .collect::<Vec<_>>();
+    let network_addresses =
+        seeds.iter().map(|_| *tcp::ListenerAddr::reserve_for_test()).collect::<Vec<_>>();
 
     let shard_layout = ShardLayout::multi_shard(num_shards, 0);
     let accounts_to_add_to_genesis: Vec<AccountId> =
         seeds.iter().map(|s| s.parse().unwrap()).collect();
 
-    let genesis = Genesis::test_with_seeds(
+    let genesis = Genesis::from_accounts(
         Clock::real(),
         accounts_to_add_to_genesis,
         num_validators,
-        get_num_seats_per_shard(num_shards, num_validators),
         shard_layout,
     );
     let mut configs = vec![];
@@ -1112,14 +1132,17 @@ pub fn create_localnet_configs_from_seeds(
 
     // We use the first validator node as the boot node.
     assert!(num_validators > 0, "No validators were added");
-    let boot_node_addr = tcp::ListenerAddr::reserve_for_test();
+    let boot_node = (network_addresses[0], network_signers[0].clone());
+
+    let mut network_configs_iter =
+        network_addresses.iter().copied().zip(network_signers.iter().cloned());
     for i in 0..num_validators {
         let params = LocalnetNodeParams::new_validator(i == 0);
         let config = create_localnet_config(
             num_validators,
             &tracked_shards_config,
-            &network_signers,
-            &boot_node_addr,
+            network_configs_iter.next().unwrap(),
+            boot_node.clone(),
             params,
         );
         configs.push(config);
@@ -1129,8 +1152,8 @@ pub fn create_localnet_configs_from_seeds(
         let config = create_localnet_config(
             num_validators,
             &tracked_shards_config,
-            &network_signers,
-            &boot_node_addr,
+            network_configs_iter.next().unwrap(),
+            boot_node.clone(),
             params,
         );
         configs.push(config);
@@ -1140,8 +1163,8 @@ pub fn create_localnet_configs_from_seeds(
         let config = create_localnet_config(
             num_validators,
             &tracked_shards_config,
-            &network_signers,
-            &boot_node_addr,
+            network_configs_iter.next().unwrap(),
+            boot_node.clone(),
             params,
         );
         configs.push(config);
@@ -1151,20 +1174,21 @@ pub fn create_localnet_configs_from_seeds(
         let config = create_localnet_config(
             num_validators,
             &tracked_shards_config,
-            &network_signers,
-            &boot_node_addr,
+            network_configs_iter.next().unwrap(),
+            boot_node.clone(),
             params,
         );
         configs.push(config);
     }
+
     (configs, validator_signers, network_signers, genesis)
 }
 
 fn create_localnet_config(
     num_validators: NumSeats,
     tracked_shards_config: &TrackedShardsConfig,
-    network_signers: &Vec<Signer>,
-    boot_node_addr: &tcp::ListenerAddr,
+    network_config: (SocketAddr, Signer),
+    boot_node: (SocketAddr, Signer),
     params: LocalnetNodeParams,
 ) -> Config {
     let mut config = Config::default();
@@ -1177,16 +1201,18 @@ fn create_localnet_config(
 
     // Configure networking and RPC endpoint. Enable debug-RPC by default for all nodes.
     config.rpc.get_or_insert(Default::default()).enable_debug_rpc = true;
-    config.network.addr = if params.is_boot {
-        boot_node_addr.to_string()
-    } else {
-        tcp::ListenerAddr::reserve_for_test().to_string()
-    };
+    config.network.addr = network_config.0.to_string();
+    config.network.public_addrs = vec![PeerAddr {
+        addr: network_config.0,
+        peer_id: PeerId::new(network_config.1.public_key()),
+    }];
+    config.network.allow_private_ip_in_public_addrs = true;
+    config.network.tier1.connect_interval = Duration::seconds(5);
     config.set_rpc_addr(tcp::ListenerAddr::reserve_for_test());
     config.network.boot_nodes = if params.is_boot {
         "".to_string()
     } else {
-        format!("{}@{}", network_signers[0].public_key(), boot_node_addr)
+        format!("{}@{}", boot_node.1.public_key(), boot_node.0)
     };
     config.network.skip_sync_wait = num_validators == 1;
 
@@ -1208,6 +1234,11 @@ fn create_localnet_config(
     } else {
         Some(tracked_shards_config.clone())
     };
+
+    // Save tx outcomes for the first validator node (for testing purposes).
+    if params.is_boot {
+        config.save_tx_outcomes = Some(true);
+    }
 
     config
 }
@@ -1292,7 +1323,7 @@ pub fn init_localnet_configs(
     for i in 0..num_all_nodes as usize {
         let config = &configs[i];
         let node_dir = dir.join(format!("{}{}", prefix, i));
-        fs::create_dir_all(node_dir.clone()).expect("Failed to create directory");
+        fs::create_dir_all(&node_dir).expect("Failed to create directory");
 
         validator_signers[i]
             .write_to_file(&node_dir.join(&config.validator_key_file))
@@ -1695,14 +1726,14 @@ mod tests {
                     gc_blocks_limit: 42,
                     gc_fork_clean_step: 420,
                     gc_num_epochs_to_keep: 24,
-                    gc_step_period: Duration::seconds(1),
+                    gc_step_period: Duration::milliseconds(500),
                 }
             } else {
                 GCConfig {
                     gc_blocks_limit: 2,
                     gc_fork_clean_step: 100,
                     gc_num_epochs_to_keep: 5,
-                    gc_step_period: Duration::seconds(1),
+                    gc_step_period: Duration::milliseconds(500),
                 }
             };
             assert_eq!(want_gc, config.gc);

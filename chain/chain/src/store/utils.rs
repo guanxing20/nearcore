@@ -1,5 +1,6 @@
-use std::sync::Arc;
-
+use super::{ReceiptFilter, filter_incoming_receipts_for_shard};
+use crate::byzantine_assert;
+use crate::metrics;
 use near_chain_primitives::Error;
 use near_epoch_manager::EpochManagerAdapter;
 use near_primitives::block::BlockHeader;
@@ -10,10 +11,7 @@ use near_primitives::sharding::{ShardChunk, ShardChunkHeader};
 use near_primitives::state_sync::ReceiptProofResponse;
 use near_primitives::types::{BlockHeight, BlockHeightDelta, ShardId};
 use near_store::adapter::chain_store::ChainStoreAdapter;
-
-use crate::byzantine_assert;
-
-use super::{ReceiptFilter, filter_incoming_receipts_for_shard};
+use std::sync::Arc;
 
 /// Get full chunk from header with `height_included` taken from `header`, with
 /// possible error that contains the header for further retrieval.
@@ -47,7 +45,7 @@ pub fn get_block_header_on_chain_by_height(
     chain_store: &ChainStoreAdapter,
     sync_hash: &CryptoHash,
     height: BlockHeight,
-) -> Result<BlockHeader, Error> {
+) -> Result<Arc<BlockHeader>, Error> {
     let mut header = chain_store.get_block_header(sync_hash)?;
     let mut hash = *sync_hash;
     while header.height() > height {
@@ -76,6 +74,8 @@ pub fn check_transaction_validity_period(
         .map_err(|_| InvalidTxError::Expired)?
         .height();
     let prev_height = prev_block_header.height();
+    metrics::CHAIN_VALIDITY_PERIOD_CHECK_DELAY
+        .observe(prev_height.saturating_sub(base_height) as f64);
     if let Ok(base_block_hash_by_height) = chain_store.get_block_hash_by_height(base_height) {
         if &base_block_hash_by_height == base_block_hash {
             if let Ok(prev_hash) = chain_store.get_block_hash_by_height(prev_height) {
@@ -218,7 +218,7 @@ pub fn get_incoming_receipts_for_shard(
 fn find_common_header(
     chain_store: &ChainStoreAdapter,
     hashes: &[CryptoHash],
-) -> Option<BlockHeader> {
+) -> Option<Arc<BlockHeader>> {
     for hash in hashes {
         if let Ok(header) = chain_store.get_block_header(hash) {
             if let Ok(header_at_height) = chain_store.get_block_header_by_height(header.height()) {
@@ -240,23 +240,25 @@ pub fn retrieve_headers(
     chain_store: &ChainStoreAdapter,
     hashes: Vec<CryptoHash>,
     max_headers_returned: u64,
-    max_height: Option<BlockHeight>,
-) -> Result<Vec<BlockHeader>, Error> {
+) -> Result<Vec<Arc<BlockHeader>>, Error> {
     let header = match find_common_header(chain_store, &hashes) {
         Some(header) => header,
         None => return Ok(vec![]),
     };
 
+    // Use `get_block_merkle_tree` to get the block ordinal for this header.
+    // We can't use the `header.block_ordinal()` method because older block headers don't have this field.
+    // The same method is used in `get_locator` which creates the headers request and chain store when saving block ordinals.
+    let block_ordinal = chain_store.get_block_merkle_tree(&header.hash())?.size();
+
     let mut headers = vec![];
-    let header_head_height = chain_store.header_head()?.height;
-    let max_height = max_height.unwrap_or(header_head_height);
-    // TODO: this may be inefficient if there are a lot of skipped blocks.
-    for h in header.height() + 1..=max_height {
-        if let Ok(header) = chain_store.get_block_header_by_height(h) {
-            headers.push(header.clone());
-            if headers.len() >= max_headers_returned as usize {
-                break;
-            }
+    for i in 1..=max_headers_returned {
+        match chain_store
+            .get_block_hash_from_ordinal(block_ordinal.saturating_add(i))
+            .and_then(|block_hash| chain_store.get_block_header(&block_hash))
+        {
+            Ok(h) => headers.push(h),
+            Err(_) => break, // This is either the last block that we know of, or we don't have these block headers because of epoch sync.
         }
     }
     Ok(headers)

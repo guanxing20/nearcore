@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 use near_async::messaging::AsyncSender;
 use near_async::time::{Clock, Duration};
 use near_chain::types::RuntimeAdapter;
+use near_o11y::span_wrapped_msg::{SpanWrapped, SpanWrappedMessageExt};
 use near_primitives::hash::CryptoHash;
 use near_primitives::state_part::PartId;
 use near_primitives::state_sync::{ShardStateSyncResponseHeader, StatePartKey};
@@ -31,7 +32,7 @@ pub(super) struct StateSyncDownloader {
     pub fallback_source: Option<Arc<dyn StateSyncDownloadSource>>,
     pub num_attempts_before_fallback: usize,
     pub header_validation_sender:
-        AsyncSender<StateHeaderValidationRequest, Result<(), near_chain::Error>>,
+        AsyncSender<SpanWrapped<StateHeaderValidationRequest>, Result<(), near_chain::Error>>,
     pub runtime: Arc<dyn RuntimeAdapter>,
     pub retry_backoff: Duration,
     pub task_tracker: TaskTracker,
@@ -69,13 +70,18 @@ impl StateSyncDownloader {
             let i = AtomicUsize::new(0); // for easier Rust async capture
             let attempt = || {
                 async {
+                    // We cannot assume that either source is infallible. We interleave attempts
+                    // to the available sources until one of them gives us the state successfully.
                     let source = if fallback_source.is_some()
                         && i.load(Ordering::Relaxed) >= num_attempts_before_fallback
                     {
+                        i.store(0, Ordering::Relaxed);
                         fallback_source.as_ref().unwrap().as_ref()
                     } else {
+                        i.fetch_add(1, Ordering::Relaxed);
                         preferred_source.as_ref()
                     };
+
                     let header = source
                         .download_shard_header(shard_id, sync_hash, handle.clone(), cancel.clone())
                         .await?;
@@ -83,11 +89,14 @@ impl StateSyncDownloader {
                     // so the chain can pick it up later, and we await until the chain gives us a response.
                     handle.set_status("Waiting for validation");
                     validation_sender
-                        .send_async(StateHeaderValidationRequest {
-                            shard_id,
-                            sync_hash,
-                            header: header.clone(),
-                        })
+                        .send_async(
+                            StateHeaderValidationRequest {
+                                shard_id,
+                                sync_hash,
+                                header: header.clone(),
+                            }
+                            .span_wrap(),
+                        )
                         .await
                         .map_err(|_| {
                             near_chain::Error::Other(
@@ -115,7 +124,6 @@ impl StateSyncDownloader {
                         }
                     }
                 }
-                i.fetch_add(1, Ordering::Relaxed);
             }
         }
         .instrument(tracing::debug_span!("StateSyncDownloader::download_shard_header"))

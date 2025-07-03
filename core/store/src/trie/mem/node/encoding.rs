@@ -263,7 +263,7 @@ impl MemTrieNodeId {
             }
             let alloc_size = node_ptr.size_of_allocation();
             arena.dealloc(self.pos, alloc_size);
-            for child in children_to_unref.iter() {
+            for child in &children_to_unref {
                 MemTrieNodeId { pos: *child }.remove_ref(arena);
             }
         }
@@ -328,7 +328,7 @@ impl<'a, M: ArenaMemory> MemTrieNodePtr<'a, M> {
 
     /// Calculates the size of the allocation with only a pointer to the start
     /// of the trie node's allocation.
-    fn size_of_allocation(&self) -> usize {
+    pub fn size_of_allocation(&self) -> usize {
         let mut decoder = self.decoder();
         let kind = decoder.peek::<CommonHeader>().kind;
         match kind {

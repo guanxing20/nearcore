@@ -25,7 +25,9 @@ fn test_congestion_control_genesis_bootstrap() {
     let clients: Vec<AccountId> = accounts.iter().map(|account| account.parse().unwrap()).collect();
 
     let epoch_length = 100;
-    let shard_layout = ShardLayout::simple_v1(&["account3", "account5", "account7"]);
+    let boundary_accounts =
+        ["account3", "account5", "account7"].iter().map(|a| a.parse().unwrap()).collect();
+    let shard_layout = ShardLayout::multi_shard_custom(boundary_accounts, 1);
     let validators_spec = ValidatorsSpec::desired_roles(&accounts[0..1], &accounts[1..2]);
 
     let genesis = TestLoopBuilder::new_genesis_builder()
@@ -58,10 +60,7 @@ fn test_congestion_control_genesis_bootstrap() {
 }
 
 fn check_genesis_congestion_info_in_store(client: &mut Client) {
-    let gc_config = client.config.gc.clone();
-    let signer = client.validator_signer.get();
-    let me = signer.as_ref().map(|signer| signer.validator_id());
-    client.chain.clear_data(&gc_config, me).unwrap();
+    client.chain.clear_data(&client.config.gc).unwrap();
 
     let infos = near_store::get_genesis_congestion_infos(&client.chain.chain_store().store())
         .unwrap()

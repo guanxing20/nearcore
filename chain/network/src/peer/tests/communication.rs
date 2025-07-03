@@ -13,9 +13,10 @@ use anyhow::Context as _;
 use assert_matches::assert_matches;
 use near_async::time;
 use near_o11y::testonly::init_test_logger;
-use near_primitives::version::{PEER_MIN_ALLOWED_PROTOCOL_VERSION, PROTOCOL_VERSION};
+use near_primitives::version::{MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION};
 use std::sync::Arc;
 
+#[allow(clippy::large_stack_frames)]
 async fn test_peer_communication(
     outbound_encoding: Option<Encoding>,
     inbound_encoding: Option<Encoding>,
@@ -98,7 +99,7 @@ async fn test_peer_communication(
 
     tracing::info!(target:"test","BlockHeaders");
     let mut events = inbound.events.from_now();
-    let want = PeerMessage::BlockHeaders(chain.get_block_headers());
+    let want = PeerMessage::BlockHeaders(chain.get_block_headers().map(Into::into).collect());
     outbound.send(want.clone()).await;
     events.recv_until(message_processed(want)).await;
 
@@ -112,7 +113,7 @@ async fn test_peer_communication(
     let mut events = inbound.events.from_now();
     let want = PeerMessage::Routed(Box::new(outbound.routed_message(
         RoutedMessageBody::PartialEncodedChunkRequest(PartialEncodedChunkRequestMsg {
-            chunk_hash: chain.blocks[5].chunks()[2].chunk_hash(),
+            chunk_hash: chain.blocks[5].chunks()[2].chunk_hash().clone(),
             part_ords: vec![],
             tracking_shards: Default::default(),
         }),
@@ -125,7 +126,7 @@ async fn test_peer_communication(
 
     tracing::info!(target:"test","PartialEncodedChunkResponse");
     let mut events = inbound.events.from_now();
-    let want_hash = chain.blocks[3].chunks()[0].chunk_hash();
+    let want_hash = chain.blocks[3].chunks()[0].chunk_hash().clone();
     let want_parts = data::make_chunk_parts(chain.chunks[&want_hash].clone());
     let want = PeerMessage::Routed(Box::new(outbound.routed_message(
         RoutedMessageBody::PartialEncodedChunkResponse(PartialEncodedChunkResponseMsg {
@@ -196,8 +197,8 @@ async fn test_handshake(outbound_encoding: Option<Encoding>, inbound_encoding: O
 
     // Send too old PROTOCOL_VERSION, expect ProtocolVersionMismatch
     let mut handshake = Handshake {
-        protocol_version: PEER_MIN_ALLOWED_PROTOCOL_VERSION - 1,
-        oldest_supported_version: PEER_MIN_ALLOWED_PROTOCOL_VERSION - 1,
+        protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION - 1,
+        oldest_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION - 1,
         sender_peer_id: outbound_cfg.id(),
         target_peer_id: inbound.cfg.id(),
         sender_listen_port: Some(outbound_port),

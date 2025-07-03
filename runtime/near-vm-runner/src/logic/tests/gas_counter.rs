@@ -3,9 +3,12 @@ use crate::logic::tests::helpers::*;
 use crate::logic::tests::vm_logic_builder::{TestVMLogic, VMLogicBuilder};
 use crate::logic::types::Gas;
 use crate::logic::{HostError, VMLogicError};
+use crate::tests::test_builder::test_builder;
 use crate::tests::test_vm_config;
 use expect_test::expect;
 use near_parameters::{ActionCosts, ExtCosts, Fee};
+use near_primitives_core::hash::CryptoHash;
+use near_primitives_core::version::ProtocolFeature;
 
 #[test]
 fn test_dont_burn_gas_when_exceeding_attached_gas_limit() {
@@ -483,6 +486,119 @@ fn deploy_contract(logic: &mut TestVMLogic) -> Result<(), VMLogicError> {
 
 /// see longer comment above for how this test works
 #[test]
+fn out_of_gas_deploy_global_contract_base() {
+    check_action_gas_exceeds_limit(
+        ActionCosts::deploy_global_contract_base,
+        1,
+        deploy_global_contract,
+    );
+
+    check_action_gas_exceeds_attached(
+        ActionCosts::deploy_global_contract_base,
+        1,
+        expect!["119677812659 burnt 10000000000000 used"],
+        deploy_global_contract,
+    );
+}
+
+/// see longer comment above for how this test works
+#[test]
+fn out_of_gas_deploy_global_contract_byte() {
+    check_action_gas_exceeds_limit(
+        ActionCosts::deploy_global_contract_byte,
+        26,
+        deploy_global_contract,
+    );
+
+    check_action_gas_exceeds_attached(
+        ActionCosts::deploy_global_contract_byte,
+        26,
+        expect!["304443562909 burnt 10000000000000 used"],
+        deploy_global_contract,
+    );
+}
+
+/// function to trigger base + 26 bytes global contract deployment costs (26 is arbitrary)
+fn deploy_global_contract(logic: &mut TestVMLogic) -> Result<(), VMLogicError> {
+    let account_id = "rick.test";
+    let idx = promise_batch_create(logic, account_id)?;
+    let code = logic.internal_mem_write(b"lorem ipsum with length 26");
+    logic.promise_batch_action_deploy_global_contract(idx, code.len, code.ptr)?;
+    Ok(())
+}
+
+/// see longer comment above for how this test works
+#[test]
+fn out_of_gas_use_global_contract_base() {
+    check_action_gas_exceeds_limit(ActionCosts::use_global_contract_base, 1, use_global_contract);
+    check_action_gas_exceeds_limit(
+        ActionCosts::use_global_contract_base,
+        1,
+        use_global_contract_by_account_id,
+    );
+
+    check_action_gas_exceeds_attached(
+        ActionCosts::use_global_contract_base,
+        1,
+        expect!["119700620657 burnt 10000000000000 used"],
+        use_global_contract,
+    );
+    check_action_gas_exceeds_attached(
+        ActionCosts::use_global_contract_base,
+        1,
+        expect!["125644575182 burnt 10000000000000 used"],
+        use_global_contract_by_account_id,
+    );
+}
+
+/// see longer comment above for how this test works
+#[test]
+fn out_of_gas_use_global_contract_byte() {
+    check_action_gas_exceeds_limit(ActionCosts::use_global_contract_byte, 32, use_global_contract);
+    check_action_gas_exceeds_limit(
+        ActionCosts::use_global_contract_byte,
+        10,
+        use_global_contract_by_account_id,
+    );
+
+    check_action_gas_exceeds_attached(
+        ActionCosts::use_global_contract_byte,
+        32,
+        expect!["304466370967 burnt 10000000000000 used"],
+        use_global_contract,
+    );
+    check_action_gas_exceeds_attached(
+        ActionCosts::use_global_contract_byte,
+        10,
+        expect!["310410325272 burnt 10000000000000 used"],
+        use_global_contract_by_account_id,
+    );
+}
+
+/// function to trigger base + 32 bytes use global contract costs (32 is the length of `CryptoHash`)
+fn use_global_contract(logic: &mut TestVMLogic) -> Result<(), VMLogicError> {
+    let account_id = "rick.test";
+    let idx = promise_batch_create(logic, account_id)?;
+    let code_hash = logic.internal_mem_write(CryptoHash::hash_bytes(b"arbitrary").as_bytes());
+    logic.promise_batch_action_use_global_contract(idx, code_hash.len, code_hash.ptr)?;
+    Ok(())
+}
+
+/// function to trigger base + 10 bytes use global contract costs (10 is arbitrary)
+fn use_global_contract_by_account_id(logic: &mut TestVMLogic) -> Result<(), VMLogicError> {
+    let account_id = "rick.test";
+    let idx = promise_batch_create(logic, account_id)?;
+    let account_id = logic.internal_mem_write(b"alice.near");
+    logic.promise_batch_action_use_global_contract_by_account_id(
+        idx,
+        account_id.len,
+        account_id.ptr,
+    )?;
+    Ok(())
+}
+
+/// see longer comment above for how this test works
+#[test]
 fn out_of_gas_function_call_base() {
     check_action_gas_exceeds_limit(ActionCosts::function_call_base, 1, cross_contract_call);
     check_action_gas_exceeds_limit(
@@ -731,4 +847,122 @@ fn test_pk() -> Vec<u8> {
 
 fn write_test_pk(logic: &mut TestVMLogic) -> MemSlice {
     logic.internal_mem_write(&test_pk())
+}
+
+#[test]
+#[allow(deprecated)]
+fn test_memory_copy_aggregate_accounting() {
+    test_builder()
+        .wat(
+            r#"
+            (module
+              (memory 0 100)
+              (func (export "main")
+                (memory.copy (i32.const 50) (i32.const 100) (i32.const 25))
+              )
+            )"#,
+        )
+        .gas(10u64.pow(10))
+        .skip_near_vm()
+        .protocol_features(&[ProtocolFeature::RefTypesBulkMemory])
+        .expects(&[expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 91000008 used gas 91000008
+            Err: PrepareError: Error happened while deserializing the module.
+        "#]],
+        expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 121441980 used gas 121441980
+        "#]]]);
+
+    test_builder()
+        .wat(
+            r#"
+            (module
+              (memory 0 100)
+              (func (export "main")
+                (memory.copy (i32.const 50) (i32.const 100) (i32.const 50))
+              )
+            )"#,
+        )
+        .gas(10u64.pow(10))
+        .skip_near_vm()
+        .protocol_features(&[ProtocolFeature::RefTypesBulkMemory])
+        .expects(&[expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 91000008 used gas 91000008
+            Err: PrepareError: Error happened while deserializing the module.
+        "#]],
+        // Gas use here should be roughly double that of the test above!
+        expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 142010880 used gas 142010880
+        "#]]]);
+}
+
+#[test]
+#[allow(deprecated)]
+fn test_memory_copy_full_memory() {
+    test_builder()
+        .wat(
+            r#"
+            (module
+              (memory 2048 2048)
+              (func (export "main")
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+              )
+            )"#,
+        )
+        .gas(Gas::MAX)
+        .skip_near_vm()
+        .protocol_features(&[ProtocolFeature::RefTypesBulkMemory])
+        .expects(&[expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 224983293 used gas 224983293
+            Err: PrepareError: Error happened while deserializing the module.
+        "#]],
+        expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 276071358793941 used gas 276071358793941
+        "#]]]);
+}
+
+#[test]
+#[allow(deprecated)]
+fn test_memory_copy_full_memory_out_of_gas() {
+    test_builder()
+        .wat(
+            r#"
+            (module
+              (memory 2048 2048)
+              (func (export "main")
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+                (memory.copy (i32.const 0) (i32.const 1) (i32.const 33554431))
+              )
+            )"#,
+        )
+        .gas(300_000_000_000_000)
+        .skip_near_vm()
+        .protocol_features(&[ProtocolFeature::RefTypesBulkMemory])
+        .expects(&[expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 253304963 used gas 253304963
+            Err: PrepareError: Error happened while deserializing the module.
+        "#]],
+        expect![[r#"
+            VMOutcome: balance 4 storage_usage 12 return data None burnt gas 300000000000000 used gas 300000000000000
+            Err: Exceeded the maximum amount of gas allowed to burn per contract.
+        "#]]]);
 }

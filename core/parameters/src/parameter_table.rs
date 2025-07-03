@@ -298,6 +298,9 @@ impl TryFrom<&ParameterTable> for RuntimeConfig {
                 burnt_gas_reward: params.get(Parameter::BurntGasReward)?,
                 pessimistic_gas_price_inflation_ratio: params
                     .get(Parameter::PessimisticGasPriceInflation)?,
+                refund_gas_price_changes: params.get(Parameter::RefundGasPriceChanges)?,
+                gas_refund_penalty: params.get(Parameter::GasRefundPenalty)?,
+                min_gas_refund_penalty: params.get(Parameter::MinGasRefundPenalty)?,
                 storage_usage_config: StorageUsageConfig {
                     storage_amount_per_byte: params.get(Parameter::StorageAmountPerByte)?,
                     num_bytes_account: params.get(Parameter::StorageNumBytesAccount)?,
@@ -316,6 +319,8 @@ impl TryFrom<&ParameterTable> for RuntimeConfig {
                 grow_mem_cost: params.get(Parameter::WasmGrowMemCost)?,
                 regular_op_cost: params.get(Parameter::WasmRegularOpCost)?,
                 discard_custom_sections: params.get(Parameter::DiscardCustomSections)?,
+                saturating_float_to_int: params.get(Parameter::SaturatingFloatToInt)?,
+                reftypes_bulk_memory: params.get(Parameter::ReftypesBulkMemory)?,
                 limit_config: serde_yaml::from_value(params.yaml_map(Parameter::vm_limits()))
                     .map_err(InvalidConfigError::InvalidYaml)?,
                 fix_contract_loading_cost: params.get(Parameter::FixContractLoadingCost)?,
@@ -325,6 +330,7 @@ impl TryFrom<&ParameterTable> for RuntimeConfig {
                 },
                 implicit_account_creation: params.get(Parameter::ImplicitAccountCreation)?,
                 eth_implicit_accounts: params.get(Parameter::EthImplicitAccounts)?,
+                global_contract_host_fns: params.get(Parameter::GlobalContractHostFns)?,
             }),
             account_creation_config: AccountCreationConfig {
                 min_allowed_top_level_account_length: params

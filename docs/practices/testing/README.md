@@ -58,10 +58,9 @@ available to test them.
 
 ## Client
 
-The Client is separated from the runtime via a `RuntimeAdapter` trait.
+The Client is separated from the runtime via a `RuntimeAdapter` trait for historical reasons.
 In production, it uses `NightshadeRuntime` which uses real runtime and epoch managers.
-To test the client without instantiating runtime and epoch manager, we have a mock runtime
-`KeyValueRuntime`.
+The same should be used in tests.
 
 Most of the tests in the client work by setting up either a single node (via
 `setup_mock()`) or multiple nodes (via `setup_mock_all_validators()`) and then
@@ -70,7 +69,7 @@ predefined timeout.
 
 For the most basic example of using this infrastructure see `produce_two_blocks`
 in
-[`tests/process_blocks.rs`](https://github.com/near/nearcore/blob/master/chain/client/src/tests/process_blocks.rs).
+[`tests/process_blocks.rs`](https://github.com/near/nearcore/blob/master/integration-tests/src/tests/client/process_blocks.rs).
 
 1. The callback (`Box::new(move |msg, _ctx, _| { ...`) is what is executed
    whenever the client sends a message. The return value of the callback is sent
@@ -83,7 +82,7 @@ in
 
 For an example of a test that launches multiple nodes, see
 `chunks_produced_and_distributed_common` in
-[tests/chunks_management.rs](https://github.com/near/nearcore/blob/master/chain/client/src/tests/chunks_management.rs).
+[integration-tests/src/tests/client/chunks_management.rs | Network chunk management test](https://github.com/near/nearcore/blob/master/integration-tests/src/tests/client/chunks_management.rs).
 The `setup_mock_all_validators` function is the key piece of infrastructure here.
 
 ## Runtime

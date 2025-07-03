@@ -7,6 +7,7 @@ use crate::trie_key::TrieKey;
 use borsh::{BorshDeserialize, BorshSerialize};
 pub use chunk_validator_stats::ChunkStats;
 use near_crypto::PublicKey;
+use near_primitives_core::account::GasKey;
 /// Reexport primitive types
 pub use near_primitives_core::types::*;
 use near_schema_checker_lib::ProtocolSchema;
@@ -32,6 +33,7 @@ pub(crate) type SignatureDifferentiator = String;
 #[derive(
     serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq, Eq, arbitrary::Arbitrary,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Finality {
     #[serde(rename = "optimistic")]
     None,
@@ -43,6 +45,7 @@ pub enum Finality {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AccountWithPublicKey {
     pub account_id: AccountId,
     pub public_key: PublicKey,
@@ -50,10 +53,12 @@ pub struct AccountWithPublicKey {
 
 /// Account info for validators
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct AccountInfo {
     pub account_id: AccountId,
     pub public_key: PublicKey,
     #[serde(with = "dec_format")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub amount: Balance,
 }
 
@@ -75,8 +80,13 @@ pub struct AccountInfo {
     BorshSerialize,
     BorshDeserialize,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(transparent)]
-pub struct StoreKey(#[serde_as(as = "Base64")] Vec<u8>);
+pub struct StoreKey(
+    #[serde_as(as = "Base64")]
+    #[cfg_attr(feature = "schemars", schemars(schema_with = "crate::serialize::base64_schema"))]
+    Vec<u8>,
+);
 
 /// This type is used to mark values returned from store (arrays of bytes).
 ///
@@ -96,8 +106,13 @@ pub struct StoreKey(#[serde_as(as = "Base64")] Vec<u8>);
     BorshSerialize,
     BorshDeserialize,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(transparent)]
-pub struct StoreValue(#[serde_as(as = "Base64")] Vec<u8>);
+pub struct StoreValue(
+    #[serde_as(as = "Base64")]
+    #[cfg_attr(feature = "schemars", schemars(schema_with = "crate::serialize::base64_schema"))]
+    Vec<u8>,
+);
 
 /// This type is used to mark function arguments.
 ///
@@ -118,8 +133,13 @@ pub struct StoreValue(#[serde_as(as = "Base64")] Vec<u8>);
     BorshSerialize,
     BorshDeserialize,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(transparent)]
-pub struct FunctionArgs(#[serde_as(as = "Base64")] Vec<u8>);
+pub struct FunctionArgs(
+    #[serde_as(as = "Base64")]
+    #[cfg_attr(feature = "schemars", schemars(schema_with = "crate::serialize::base64_schema"))]
+    Vec<u8>,
+);
 
 /// A structure used to indicate the kind of state changes due to transaction/receipt processing, etc.
 #[derive(Debug, Clone)]
@@ -196,6 +216,8 @@ pub enum StateChangeCause {
     /// State change that is happens due to migration that happens in first block of an epoch
     /// after protocol upgrade
     Migration,
+    /// Deprecated in #13155, we need to keep it to preserve enum variant tags for borsh serialization.
+    _UnusedReshardingV2,
     /// Update persistent state kept by Bandwidth Scheduler after running the scheduling algorithm.
     BandwidthSchedulerStateUpdate,
 }
@@ -228,7 +250,9 @@ pub type RawStateChanges = std::collections::BTreeMap<Vec<u8>, RawStateChangesWi
 pub enum StateChangesRequest {
     AccountChanges { account_ids: Vec<AccountId> },
     SingleAccessKeyChanges { keys: Vec<AccountWithPublicKey> },
+    SingleGasKeyChanges { keys: Vec<AccountWithPublicKey> },
     AllAccessKeyChanges { account_ids: Vec<AccountId> },
+    AllGasKeyChanges { account_ids: Vec<AccountId> },
     ContractCodeChanges { account_ids: Vec<AccountId> },
     DataChanges { account_ids: Vec<AccountId>, key_prefix: StoreKey },
 }
@@ -239,6 +263,9 @@ pub enum StateChangeValue {
     AccountDeletion { account_id: AccountId },
     AccessKeyUpdate { account_id: AccountId, public_key: PublicKey, access_key: AccessKey },
     AccessKeyDeletion { account_id: AccountId, public_key: PublicKey },
+    GasKeyUpdate { account_id: AccountId, public_key: PublicKey, gas_key: GasKey },
+    GasKeyNonceUpdate { account_id: AccountId, public_key: PublicKey, index: u32, nonce: u64 },
+    GasKeyDeletion { account_id: AccountId, public_key: PublicKey },
     DataUpdate { account_id: AccountId, key: StoreKey, value: StoreValue },
     DataDeletion { account_id: AccountId, key: StoreKey },
     ContractCodeUpdate { account_id: AccountId, code: Vec<u8> },
@@ -252,6 +279,9 @@ impl StateChangeValue {
             | StateChangeValue::AccountDeletion { account_id }
             | StateChangeValue::AccessKeyUpdate { account_id, .. }
             | StateChangeValue::AccessKeyDeletion { account_id, .. }
+            | StateChangeValue::GasKeyUpdate { account_id, .. }
+            | StateChangeValue::GasKeyNonceUpdate { account_id, .. }
+            | StateChangeValue::GasKeyDeletion { account_id, .. }
             | StateChangeValue::DataUpdate { account_id, .. }
             | StateChangeValue::DataDeletion { account_id, .. }
             | StateChangeValue::ContractCodeUpdate { account_id, .. }
@@ -313,6 +343,50 @@ impl StateChanges {
                             },
                         },
                     ))
+                }
+                TrieKey::GasKey { account_id, public_key, index } => {
+                    if let Some(index) = index {
+                        state_changes.extend(changes.into_iter().filter_map(
+                            |RawStateChange { cause, data }| {
+                                if let Some(change_data) = data {
+                                    Some(StateChangeWithCause {
+                                        cause,
+                                        value: StateChangeValue::GasKeyNonceUpdate {
+                                            account_id: account_id.clone(),
+                                            public_key: public_key.clone(),
+                                            index,
+                                            nonce: <_>::try_from_slice(&change_data).expect(
+                                                "Failed to parse internally stored gas key nonce",
+                                            ),
+                                        },
+                                    })
+                                } else {
+                                    // Deletion of a nonce can only be done with a corresponding
+                                    // deletion of the gas key, so we don't need to report these.
+                                    None
+                                }
+                            },
+                        ));
+                    } else {
+                        state_changes.extend(changes.into_iter().map(
+                            |RawStateChange { cause, data }| StateChangeWithCause {
+                                cause,
+                                value: if let Some(change_data) = data {
+                                    StateChangeValue::GasKeyUpdate {
+                                        account_id: account_id.clone(),
+                                        public_key: public_key.clone(),
+                                        gas_key: <_>::try_from_slice(&change_data)
+                                            .expect("Failed to parse internally stored gas key"),
+                                    }
+                                } else {
+                                    StateChangeValue::GasKeyDeletion {
+                                        account_id: account_id.clone(),
+                                        public_key: public_key.clone(),
+                                    }
+                                },
+                            },
+                        ));
+                    }
                 }
                 TrieKey::ContractCode { account_id } => {
                     state_changes.extend(changes.into_iter().map(
@@ -405,6 +479,24 @@ impl StateChanges {
             .collect())
     }
 
+    pub fn from_gas_key_changes(
+        raw_changes: impl Iterator<Item = Result<RawStateChangesWithTrieKey, std::io::Error>>,
+    ) -> Result<StateChanges, std::io::Error> {
+        let state_changes = Self::from_changes(raw_changes)?;
+
+        Ok(state_changes
+            .into_iter()
+            .filter(|state_change| {
+                matches!(
+                    state_change.value,
+                    StateChangeValue::GasKeyUpdate { .. }
+                        | StateChangeValue::GasKeyNonceUpdate { .. }
+                        | StateChangeValue::GasKeyDeletion { .. }
+                )
+            })
+            .collect())
+    }
+
     pub fn from_contract_code_changes(
         raw_changes: impl Iterator<Item = Result<RawStateChangesWithTrieKey, std::io::Error>>,
     ) -> Result<StateChanges, std::io::Error> {
@@ -482,6 +574,7 @@ impl StateRootNode {
     arbitrary::Arbitrary,
     ProtocolSchema,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[as_ref(forward)]
 pub struct EpochId(pub CryptoHash);
 
@@ -735,8 +828,7 @@ pub mod chunk_extra {
     use crate::types::validator_stake::{ValidatorStake, ValidatorStakeIter};
     use borsh::{BorshDeserialize, BorshSerialize};
     use near_primitives_core::hash::CryptoHash;
-    use near_primitives_core::types::{Balance, Gas, ProtocolVersion};
-    use near_primitives_core::version::{PROTOCOL_VERSION, ProtocolFeature};
+    use near_primitives_core::types::{Balance, Gas};
 
     pub use super::ChunkExtraV1;
 
@@ -813,7 +905,6 @@ pub mod chunk_extra {
             // TODO(congestion_control) - integration with resharding
             let congestion_control = Some(CongestionInfo::default());
             Self::new(
-                PROTOCOL_VERSION,
                 state_root,
                 CryptoHash::default(),
                 vec![],
@@ -821,12 +912,11 @@ pub mod chunk_extra {
                 0,
                 0,
                 congestion_control,
-                BandwidthRequests::default_for_protocol_version(PROTOCOL_VERSION),
+                BandwidthRequests::empty(),
             )
         }
 
         pub fn new(
-            protocol_version: ProtocolVersion,
             state_root: &StateRoot,
             outcome_root: CryptoHash,
             validator_proposals: Vec<ValidatorStake>,
@@ -834,40 +924,18 @@ pub mod chunk_extra {
             gas_limit: Gas,
             balance_burnt: Balance,
             congestion_info: Option<CongestionInfo>,
-            bandwidth_requests: Option<BandwidthRequests>,
+            bandwidth_requests: BandwidthRequests,
         ) -> Self {
-            if ProtocolFeature::BandwidthScheduler.enabled(protocol_version) {
-                assert!(bandwidth_requests.is_some());
-                Self::V4(ChunkExtraV4 {
-                    state_root: *state_root,
-                    outcome_root,
-                    validator_proposals,
-                    gas_used,
-                    gas_limit,
-                    balance_burnt,
-                    congestion_info: congestion_info.unwrap(),
-                    bandwidth_requests: bandwidth_requests.unwrap(),
-                })
-            } else if congestion_info.is_some() {
-                Self::V3(ChunkExtraV3 {
-                    state_root: *state_root,
-                    outcome_root,
-                    validator_proposals,
-                    gas_used,
-                    gas_limit,
-                    balance_burnt,
-                    congestion_info: congestion_info.unwrap(),
-                })
-            } else {
-                Self::V2(ChunkExtraV2 {
-                    state_root: *state_root,
-                    outcome_root,
-                    validator_proposals,
-                    gas_used,
-                    gas_limit,
-                    balance_burnt,
-                })
-            }
+            Self::V4(ChunkExtraV4 {
+                state_root: *state_root,
+                outcome_root,
+                validator_proposals,
+                gas_used,
+                gas_limit,
+                balance_burnt,
+                congestion_info: congestion_info.unwrap(),
+                bandwidth_requests,
+            })
         }
 
         #[inline]
@@ -993,6 +1061,7 @@ pub struct ChunkExtraV1 {
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, arbitrary::Arbitrary,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum BlockId {
     Height(BlockHeight),
@@ -1004,6 +1073,7 @@ pub type MaybeBlockId = Option<BlockId>;
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, arbitrary::Arbitrary,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SyncCheckpoint {
     Genesis,
@@ -1013,6 +1083,7 @@ pub enum SyncCheckpoint {
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, arbitrary::Arbitrary,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BlockReference {
     BlockId(BlockId),
@@ -1069,6 +1140,7 @@ pub struct BlockChunkValidatorStats {
 }
 
 #[derive(serde::Deserialize, Debug, arbitrary::Arbitrary, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EpochReference {
     EpochId(EpochId),
@@ -1119,6 +1191,7 @@ pub enum ValidatorInfoIdentifier {
     Eq,
     ProtocolSchema,
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum ValidatorKickoutReason {
     /// Deprecated
     _UnusedSlashed,
@@ -1131,17 +1204,23 @@ pub enum ValidatorKickoutReason {
     /// Validator stake is now below threshold
     NotEnoughStake {
         #[serde(with = "dec_format", rename = "stake_u128")]
+        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
         stake: Balance,
         #[serde(with = "dec_format", rename = "threshold_u128")]
+        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
         threshold: Balance,
     },
     /// Enough stake but is not chosen because of seat limits.
     DidNotGetASeat,
     /// Validator didn't produce enough chunk endorsements.
     NotEnoughChunkEndorsements { produced: NumBlocks, expected: NumBlocks },
+    /// Validator's last block proposal was for a protocol version older than
+    /// the network's voted protocol version.
+    ProtocolVersionTooOld { version: ProtocolVersion, network_version: ProtocolVersion },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransactionOrReceiptId {
     Transaction { transaction_hash: CryptoHash, sender_id: AccountId },

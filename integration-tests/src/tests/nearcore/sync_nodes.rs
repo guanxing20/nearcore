@@ -14,8 +14,9 @@ use near_o11y::WithSpanContextExt;
 use near_o11y::testonly::init_integration_logger;
 use near_primitives::transaction::SignedTransaction;
 use nearcore::{load_test_config, start_with_config};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 
 /// Starts one validation node, it reduces it's stake to 1/2 of the stake.
 /// Second node starts after 1s, needs to catchup & state sync and then make sure it's
@@ -45,7 +46,7 @@ fn ultra_slow_test_sync_state_stake_change() {
         let dir2 = tempfile::Builder::new().prefix("sync_state_stake_change_2").tempdir().unwrap();
         run_actix(async {
             let nearcore::NearNode {
-                view_client: view_client1, tx_processor: tx_processor1, ..
+                view_client: view_client1, rpc_handler: tx_processor1, ..
             } = start_with_config(dir1.path(), near1.clone()).expect("start_with_config");
 
             let genesis_hash = *genesis_block(&genesis).hash();
@@ -91,7 +92,7 @@ fn ultra_slow_test_sync_state_stake_change() {
                             let nearcore::NearNode { view_client: view_client2, arbiters, .. } =
                                 start_with_config(&dir2_path_copy, near2_copy)
                                     .expect("start_with_config");
-                            *arbiters_holder2.write().unwrap() = arbiters;
+                            *arbiters_holder2.write() = arbiters;
 
                             WaitOrTimeoutActor::new(
                                 Box::new(move |_ctx| {

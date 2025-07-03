@@ -5,13 +5,12 @@ use near_async::messaging::Actor;
 use near_async::messaging::Handler;
 use near_chain::ChainGenesis;
 use near_chain::{ChainStore, ChainStoreAccess, types::RuntimeAdapter};
-use near_chain_configs::{GCConfig, MutableValidatorSigner};
+use near_chain_configs::GCConfig;
 use near_epoch_manager::EpochManagerAdapter;
 use near_epoch_manager::shard_tracker::ShardTracker;
 use near_store::Store;
 use near_store::db::metadata::DbKind;
 use std::sync::Arc;
-use tracing::warn;
 
 /// An actor for garbage collection that runs in its own thread
 /// The actor runs periodically, as determined by `gc_step_period`,
@@ -21,7 +20,6 @@ pub struct GCActor {
     runtime_adapter: Arc<dyn RuntimeAdapter>,
     epoch_manager: Arc<dyn EpochManagerAdapter>,
     shard_tracker: ShardTracker,
-    validator_signer: MutableValidatorSigner,
     gc_config: GCConfig,
     is_archive: bool,
     /// In some tests we may want to temporarily disable GC
@@ -35,7 +33,6 @@ impl GCActor {
         runtime_adapter: Arc<dyn RuntimeAdapter>,
         epoch_manager: Arc<dyn EpochManagerAdapter>,
         shard_tracker: ShardTracker,
-        validator_signer: MutableValidatorSigner,
         gc_config: GCConfig,
         is_archive: bool,
     ) -> Self {
@@ -45,15 +42,12 @@ impl GCActor {
             gc_config,
             epoch_manager,
             shard_tracker,
-            validator_signer,
             is_archive,
             no_gc: false,
         }
     }
 
     fn clear_data(&mut self) -> Result<(), near_chain::Error> {
-        let signer = self.validator_signer.get();
-        let me = signer.as_ref().map(|signer| signer.validator_id());
         // A RPC node should do regular garbage collection.
         if !self.is_archive {
             return self.store.clear_data(
@@ -61,13 +55,13 @@ impl GCActor {
                 self.runtime_adapter.clone(),
                 self.epoch_manager.clone(),
                 &self.shard_tracker,
-                me,
             );
         }
-        // ReshardingV3 mapping for archival nodes (#12578) was built under assumption
-        // that archival nodes keep tracking all shards. If this ever changes and need
-        // to remove this assert, make sure State mapping is properly handled.
-        debug_assert!(self.shard_tracker.tracks_all_shards());
+        // The ReshardingV3 mapping for archival nodes (#12578) was built under the assumption that
+        // once we start tracking a shard, we continue tracking all of its descendant shards.
+        // If this ever changes and this assertion needs to be removed, please make sure to
+        // properly handle the State Mapping.
+        debug_assert!(self.shard_tracker.is_valid_for_archival());
 
         // An archival node with split storage should perform garbage collection
         // on the hot storage. In order to determine if split storage is enabled
@@ -81,7 +75,6 @@ impl GCActor {
                 self.runtime_adapter.clone(),
                 self.epoch_manager.clone(),
                 &self.shard_tracker,
-                me,
             );
         }
 
@@ -90,24 +83,35 @@ impl GCActor {
         self.store.clear_archive_data(self.gc_config.gc_blocks_limit, self.runtime_adapter.clone())
     }
 
-    fn gc(&mut self, ctx: &mut dyn DelayedActionRunner<Self>) {
-        if !self.no_gc {
-            let timer = metrics::GC_TIME.start_timer();
-            if let Err(e) = self.clear_data() {
-                warn!(target: "garbage collection", "Error in gc: {}", e);
-            }
-            timer.observe_duration();
+    fn gc(&mut self) {
+        if self.no_gc {
+            tracing::warn!(target: "garbage collection", "GC is disabled");
+            return;
+        }
+        if self.store.head().is_err() {
+            tracing::warn!(target: "garbage collection", "State not initialized yet. Head doesn't exist.");
+            return;
         }
 
+        let timer = metrics::GC_TIME.start_timer();
+        if let Err(e) = self.clear_data() {
+            tracing::error!(target: "garbage collection", "Error in gc: {}", e);
+            debug_assert!(false, "Error in GCActor");
+        }
+        timer.observe_duration();
+    }
+
+    fn gc_loop(&mut self, ctx: &mut dyn DelayedActionRunner<Self>) {
+        self.gc();
         ctx.run_later("garbage collection", self.gc_config.gc_step_period, move |act, ctx| {
-            act.gc(ctx);
+            act.gc_loop(ctx);
         });
     }
 }
 
 impl Actor for GCActor {
     fn start_actor(&mut self, ctx: &mut dyn DelayedActionRunner<Self>) {
-        self.gc(ctx);
+        self.gc_loop(ctx);
     }
 }
 

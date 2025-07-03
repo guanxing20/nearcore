@@ -54,7 +54,7 @@ impl RuntimeError {
     /// assert_eq!("unexpected error", trap.message());
     /// ```
     pub fn new<I: Into<String>>(message: I) -> Self {
-        let info = FRAME_INFO.read().unwrap();
+        let info = FRAME_INFO.read();
         let msg = message.into();
         Self::new_with_trace(
             &info,
@@ -66,7 +66,7 @@ impl RuntimeError {
 
     /// Create a new RuntimeError from a Trap.
     pub fn from_trap(trap: Trap) -> Self {
-        let info = FRAME_INFO.read().unwrap();
+        let info = FRAME_INFO.read();
         match trap {
             // A user error
             Trap::User(error) => {
@@ -110,7 +110,7 @@ impl RuntimeError {
         source: RuntimeErrorSource,
         native_trace: Backtrace,
     ) -> Self {
-        let frames: Vec<usize> = native_trace
+        let wasm_trace = native_trace
             .frames()
             .iter()
             .filter_map(|frame| {
@@ -128,15 +128,11 @@ impl RuntimeError {
                     // the stack). In that case we want to lookup information for the
                     // previous instruction (the call instruction) so we subtract one as
                     // the lookup.
-                    let pc_to_lookup = if Some(pc) == trap_pc { pc } else { pc - 1 };
-                    Some(pc_to_lookup)
+                    let pc = if Some(pc) == trap_pc { pc } else { pc - 1 };
+                    info.lookup_frame_info(pc)
                 }
             })
             .collect();
-
-        // Let's construct the trace
-        let wasm_trace =
-            frames.into_iter().filter_map(|pc| info.lookup_frame_info(pc)).collect::<Vec<_>>();
 
         Self { inner: Arc::new(RuntimeErrorInner { source, wasm_trace, native_trace }) }
     }
@@ -201,7 +197,7 @@ impl fmt::Display for RuntimeError {
         if trace.is_empty() {
             return Ok(());
         }
-        for frame in self.trace().iter() {
+        for frame in self.trace() {
             let name = frame.module_name();
             let func_index = frame.func_index();
             writeln!(f)?;

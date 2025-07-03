@@ -6,6 +6,7 @@ use crate::receipt_manager::ReceiptManager;
 use near_crypto::{KeyType, PublicKey};
 use near_parameters::RuntimeConfigStore;
 use near_primitives::account::{AccessKey, Account};
+use near_primitives::action::GlobalContractIdentifier;
 use near_primitives::apply::ApplyChunkReason;
 use near_primitives::bandwidth_scheduler::BlockBandwidthRequests;
 use near_primitives::borsh::BorshDeserialize;
@@ -34,8 +35,6 @@ pub struct ViewApplyState {
     pub block_height: BlockHeight,
     /// Prev block hash
     pub prev_block_hash: CryptoHash,
-    /// Currently building block hash
-    pub block_hash: CryptoHash,
     /// To which shard the applied chunk belongs.
     pub shard_id: ShardId,
     /// Current epoch id
@@ -85,17 +84,27 @@ impl TrieViewer {
         })
     }
 
-    pub fn view_contract_code(
+    pub fn view_account_contract_code(
         &self,
         state_update: &TrieUpdate,
         account_id: &AccountId,
     ) -> Result<ContractCode, errors::ViewContractCodeError> {
         let account = self.view_account(state_update, account_id)?;
-        state_update
-            .get_code(account_id.clone(), account.local_contract_hash().unwrap_or_default())?
-            .ok_or_else(|| errors::ViewContractCodeError::NoContractCode {
+        state_update.get_account_contract_code(account_id, account.contract().as_ref())?.ok_or_else(
+            || errors::ViewContractCodeError::NoContractCode {
                 contract_account_id: account_id.clone(),
-            })
+            },
+        )
+    }
+
+    pub fn view_global_contract_code(
+        &self,
+        state_update: &TrieUpdate,
+        identifier: GlobalContractIdentifier,
+    ) -> Result<ContractCode, errors::ViewContractCodeError> {
+        state_update
+            .get_global_contract_code(identifier.clone().into())?
+            .ok_or(errors::ViewContractCodeError::NoGlobalContractCode { identifier })
     }
 
     pub fn view_access_key(
@@ -212,7 +221,6 @@ impl TrieViewer {
             block_height: view_state.block_height,
             // Used for legacy reasons
             prev_block_hash: view_state.prev_block_hash,
-            block_hash: view_state.block_hash,
             shard_id: view_state.shard_id,
             epoch_id: view_state.epoch_id,
             epoch_height: view_state.epoch_height,
@@ -226,6 +234,7 @@ impl TrieViewer {
             is_new_chunk: false,
             congestion_info: Default::default(),
             bandwidth_requests: BlockBandwidthRequests::empty(),
+            trie_access_tracker_state: Default::default(),
         };
         let function_call = FunctionCallAction {
             method_name: method_name.to_string(),
@@ -254,12 +263,8 @@ impl TrieViewer {
             state_update.contract_storage(),
         );
         let view_config = Some(ViewConfig { max_gas_burnt: self.max_gas_burnt_view });
-        let contract = pipeline.get_contract(
-            &receipt,
-            account.local_contract_hash().unwrap_or_default(),
-            0,
-            view_config.clone(),
-        );
+        let code_hash = state_update.get_account_contract_hash(account.contract().as_ref())?;
+        let contract = pipeline.get_contract(&receipt, code_hash, 0, view_config.clone());
 
         let mut runtime_ext = RuntimeExt::new(
             &mut state_update,
@@ -268,11 +273,11 @@ impl TrieViewer {
             account,
             empty_hash,
             view_state.epoch_id,
-            view_state.block_hash,
             view_state.block_height,
             epoch_info_provider,
             view_state.current_protocol_version,
             config.wasm_config.storage_get_mode,
+            Arc::clone(&apply_state.trie_access_tracker_state),
         );
         let outcome = execute_function_call(
             contract,

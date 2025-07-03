@@ -87,8 +87,8 @@ async fn send_and_recv_tier1_message(
             _ => None,
         })
         .await;
-    assert_eq!(from.cfg.node_id(), got.author);
-    assert_eq!(want, got.body);
+    assert_eq!(from.cfg.node_id(), got.author().clone());
+    assert_eq!(want, got.body_owned());
 }
 
 /// Send a message over each connection.
@@ -289,6 +289,7 @@ async fn account_keys_change() {
 // then proxy1 is available and proxy0 is not. In both situations validator should be reachable,
 // as long as it manages to advertise the currently available proxy and the TIER1 nodes connect to
 // that proxy.
+#[allow(clippy::large_stack_frames)]
 #[tokio::test]
 async fn proxy_change() {
     init_test_logger();

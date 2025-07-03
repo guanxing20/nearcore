@@ -16,6 +16,9 @@
 //! Moreover, we include all left siblings for each path, because they are
 //! necessary to prove its position in the list of prefix sums.
 
+use super::ops::iter::TrieTraversalItem;
+use super::trie_storage_update::{TrieStorageNode, TrieStorageNodeWithSize};
+use super::{AccessOptions, TrieRefcountDeltaMap};
 use crate::flat::{FlatStateChanges, FlatStateIterator};
 use crate::trie::nibble_slice::NibbleSlice;
 use crate::trie::trie_storage::TrieMemoryPartialStorage;
@@ -31,10 +34,6 @@ use near_primitives::types::{ShardId, StateRoot};
 use near_vm_runner::ContractCode;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-use super::TrieRefcountDeltaMap;
-use super::ops::iter::TrieTraversalItem;
-use super::trie_storage_update::{TrieStorageNode, TrieStorageNodeWithSize};
 
 /// Trie key in nibbles corresponding to the right boundary for the last state part.
 /// Guaranteed to be bigger than any existing trie key.
@@ -135,7 +134,7 @@ impl Trie {
         let _span = tracing::debug_span!(
             target: "state-parts",
             "get_state_part_boundaries",
-            ?shard_id,
+            %shard_id,
             part_id = part_id.idx,
             num_parts = part_id.total)
         .entered();
@@ -190,7 +189,7 @@ impl Trie {
         let _span = tracing::debug_span!(
             target: "state-parts",
             "get_trie_nodes_for_part_with_flat_storage",
-            ?shard_id,
+            %shard_id,
             part_id = part_id.idx,
             num_parts = part_id.total)
         .entered();
@@ -231,7 +230,12 @@ impl Trie {
             .start_timer();
         let looked_up_value_refs: Vec<_> = value_refs
             .iter()
-            .map(|(k, hash)| Ok((k.clone(), Some(state_trie.retrieve_value(hash)?.to_vec()))))
+            .map(|(k, hash)| {
+                Ok((
+                    k.clone(),
+                    Some(state_trie.retrieve_value(hash, AccessOptions::DEFAULT)?.to_vec()),
+                ))
+            })
             .collect::<Result<_, StorageError>>()
             .unwrap();
         all_state_part_items.extend(looked_up_value_refs.iter().cloned());
@@ -243,8 +247,9 @@ impl Trie {
             .start_timer();
         let local_state_part_trie =
             Trie::new(Arc::new(TrieMemoryPartialStorage::default()), StateRoot::new(), None);
-        let local_state_part_nodes =
-            local_state_part_trie.update(all_state_part_items.into_iter())?.insertions;
+        let local_state_part_nodes = local_state_part_trie
+            .update(all_state_part_items.into_iter(), AccessOptions::DEFAULT)?
+            .insertions;
         let local_trie_creation_duration = local_trie_creation_timer.stop_and_record();
 
         // 4. Unite all nodes in memory, traverse trie based on them, return set of visited nodes.
@@ -427,7 +432,7 @@ impl Trie {
         trie.visit_nodes_for_state_part(part_id)?;
         let storage = trie.storage.as_partial_storage().unwrap();
 
-        if storage.visited_nodes.read().expect("read visited_nodes").len() != num_nodes {
+        if storage.visited_nodes.read().len() != num_nodes {
             // As all nodes belonging to state part were visited, there is some
             // unexpected data in downloaded state part.
             return Err(StorageError::UnexpectedTrieValue);
@@ -456,7 +461,7 @@ impl Trie {
         let mut flat_state_delta = FlatStateChanges::default();
         let mut contract_codes = Vec::new();
         for TrieTraversalItem { hash, key } in trie_traversal_items {
-            let value = trie.retrieve_value(&hash)?;
+            let value = trie.retrieve_value(&hash, AccessOptions::DEFAULT)?;
             refcount_changes.add(hash, value.to_vec(), 1);
             if let Some(trie_key) = key {
                 let flat_state_value = FlatStateValue::on_disk(&value);
@@ -502,7 +507,8 @@ impl Trie {
         &self,
         hash: &CryptoHash,
     ) -> Result<TrieStorageNodeWithSize, StorageError> {
-        Ok(match self.retrieve_raw_node(hash, true, true)?.map(|node| node.1) {
+        let node = self.retrieve_raw_node(hash, true, AccessOptions::DEFAULT)?;
+        Ok(match node.map(|node| node.1) {
             Some(node) => TrieStorageNodeWithSize::from_raw_trie_node_with_size(node),
             None => Default::default(),
         })
@@ -526,11 +532,11 @@ mod tests {
     use crate::adapter::StoreUpdateAdapter;
     use crate::test_utils::{TestTriesBuilder, gen_changes, test_populate_trie};
     use crate::trie::ops::iter::CrumbStatus;
-    use crate::trie::{
-        TrieRefcountAddition, TrieRefcountDeltaMap, TrieRefcountSubtraction, ValueHandle,
-    };
+    use crate::trie::trie_tests::merge_trie_changes;
+    use crate::trie::{TrieRefcountAddition, ValueHandle};
 
     use super::*;
+    use crate::MissingTrieValue;
     use crate::MissingTrieValueContext;
     use near_primitives::shard_layout::ShardUId;
 
@@ -564,7 +570,7 @@ mod tests {
         for part_id in 1..num_parts {
             let nibbles_boundary = trie.find_state_part_boundary(part_id, num_parts).unwrap();
             let key_boundary = NibbleSlice::nibbles_to_bytes(&nibbles_boundary);
-            assert_matches!(trie.get(&key_boundary), Ok(Some(_)));
+            assert_matches!(trie.get(&key_boundary, AccessOptions::DEFAULT), Ok(Some(_)));
         }
 
         let nibbles_boundary = trie.find_state_part_boundary(num_parts, num_parts).unwrap();
@@ -632,7 +638,7 @@ mod tests {
                 if let Some((_bytes, rc)) = insertions.get_mut(hash) {
                     *rc += 1;
                 } else {
-                    let bytes = trie.retrieve_value(hash)?;
+                    let bytes = trie.retrieve_value(hash, AccessOptions::DEFAULT)?;
                     insertions.insert(*hash, (bytes.to_vec(), 1));
                 }
                 Ok(())
@@ -839,7 +845,10 @@ mod tests {
                     trie_recording.find_state_part_boundary(part_id, num_parts).unwrap();
                 let left_key_boundary = NibbleSlice::nibbles_to_bytes(&left_nibbles_boundary);
                 if part_id != 0 {
-                    assert_matches!(trie.get(&left_key_boundary), Ok(Some(_)));
+                    assert_matches!(
+                        trie.get(&left_key_boundary, AccessOptions::DEFAULT),
+                        Ok(Some(_))
+                    );
                 }
                 let PartialState::TrieValues(proof_nodes) =
                     trie_recording.recorded_storage().unwrap().nodes;
@@ -882,35 +891,6 @@ mod tests {
     #[test]
     fn test_parts_not_huge_2() {
         run_test_parts_not_huge(construct_trie_for_big_parts_2, 100_000);
-    }
-
-    fn merge_trie_changes(changes: Vec<TrieChanges>) -> TrieChanges {
-        if changes.is_empty() {
-            return TrieChanges::empty(Trie::EMPTY_ROOT);
-        }
-        let new_root = changes[0].new_root;
-        let mut map = TrieRefcountDeltaMap::new();
-        for changes_set in changes {
-            assert!(changes_set.deletions.is_empty(), "state parts only have insertions");
-            for TrieRefcountAddition { trie_node_or_value_hash, trie_node_or_value, rc } in
-                changes_set.insertions
-            {
-                map.add(trie_node_or_value_hash, trie_node_or_value, rc.get());
-            }
-            for TrieRefcountSubtraction { trie_node_or_value_hash, rc, .. } in changes_set.deletions
-            {
-                map.subtract(trie_node_or_value_hash, rc.get());
-            }
-        }
-        let (insertions, deletions) = map.into_changes();
-        TrieChanges {
-            old_root: Default::default(),
-            new_root,
-            insertions,
-            deletions,
-            memtrie_changes: None,
-            children_memtrie_changes: Default::default(),
-        }
     }
 
     #[test]
@@ -1054,7 +1034,7 @@ mod tests {
         ];
 
         let changes_for_trie = state_items.iter().cloned().map(|(k, v)| (k, Some(v)));
-        let trie_changes = trie.update(changes_for_trie).unwrap();
+        let trie_changes = trie.update(changes_for_trie, AccessOptions::DEFAULT).unwrap();
         let mut store_update = tries.store_update();
         let root = tries.apply_all(&trie_changes, shard_uid, &mut store_update);
         store_update.commit().unwrap();
@@ -1082,10 +1062,10 @@ mod tests {
 
         assert_matches!(
             Trie::validate_state_part(&root, part_id, wrong_state_part),
-            Err(StorageError::MissingTrieValue(
-                MissingTrieValueContext::TrieMemoryPartialStorage,
-                _
-            ))
+            Err(StorageError::MissingTrieValue(MissingTrieValue {
+                context: MissingTrieValueContext::TrieMemoryPartialStorage,
+                hash: _
+            }))
         );
 
         // Add extra value to the state part, check that validation fails.
@@ -1169,7 +1149,7 @@ mod tests {
             (b"cb".to_vec(), vec![9; value_len]),
         ];
         let changes_for_trie = state_items.iter().cloned().map(|(k, v)| (k, Some(v)));
-        let trie_changes = trie.update(changes_for_trie).unwrap();
+        let trie_changes = trie.update(changes_for_trie, AccessOptions::DEFAULT).unwrap();
         let mut store_update = tries.store_update();
         let root = tries.apply_all(&trie_changes, shard_uid, &mut store_update);
         store_update.commit().unwrap();
@@ -1198,10 +1178,10 @@ mod tests {
                 nibbles_end,
                 &trie_without_flat,
             ),
-            Err(StorageError::MissingTrieValue(
-                MissingTrieValueContext::TrieMemoryPartialStorage,
-                _
-            ))
+            Err(StorageError::MissingTrieValue(MissingTrieValue {
+                context: MissingTrieValueContext::TrieMemoryPartialStorage,
+                hash: _
+            }))
         );
 
         // Fill flat storage and check that state part creation succeeds.
@@ -1237,7 +1217,10 @@ mod tests {
 
         assert_eq!(
             trie_without_flat.get_trie_nodes_for_part_without_flat_storage(part_id),
-            Err(StorageError::MissingTrieValue(MissingTrieValueContext::TrieStorage, value_hash)),
+            Err(StorageError::MissingTrieValue(MissingTrieValue {
+                context: MissingTrieValueContext::TrieStorage,
+                hash: value_hash
+            })),
         );
 
         assert_eq!(
@@ -1267,10 +1250,10 @@ mod tests {
                 nibbles_end,
                 &trie_without_flat,
             ),
-            Err(StorageError::MissingTrieValue(
-                MissingTrieValueContext::TrieMemoryPartialStorage,
-                _
-            ))
+            Err(StorageError::MissingTrieValue(MissingTrieValue {
+                context: MissingTrieValueContext::TrieMemoryPartialStorage,
+                hash: _
+            }))
         );
     }
 }

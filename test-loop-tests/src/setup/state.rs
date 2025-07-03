@@ -1,14 +1,16 @@
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 
 use near_async::messaging::{IntoMultiSender, IntoSender, Sender};
 use near_async::test_loop::data::TestLoopDataHandle;
 use near_async::test_loop::sender::TestLoopSender;
 use near_async::time::Duration;
+use near_chain::resharding::resharding_actor::ReshardingActor;
 use near_chain_configs::{ClientConfig, Genesis};
 use near_chunks::shards_manager_actor::ShardsManagerActor;
+use near_client::chunk_executor_actor::{ChunkExecutorActor, ExecutorIncomingReceipts};
 use near_client::client_actor::ClientActorInner;
-use near_client::{PartialWitnessActor, TxRequestHandler, ViewClientActorInner};
+use near_client::{PartialWitnessActor, RpcHandler, ViewClientActorInner};
 use near_jsonrpc::ViewClientSenderForRpc;
 use near_network::shards_manager::ShardsManagerRequestFromNetwork;
 use near_network::state_witness::PartialWitnessSenderForNetwork;
@@ -19,6 +21,7 @@ use near_primitives::types::AccountId;
 use near_primitives::upgrade_schedule::ProtocolUpgradeVotingSchedule;
 use near_store::Store;
 use nearcore::state_sync::StateSyncDumper;
+use parking_lot::Mutex;
 use tempfile::TempDir;
 
 use crate::utils::peer_manager_actor::{
@@ -71,11 +74,13 @@ pub struct NodeExecutionData {
     pub peer_id: PeerId,
     pub client_sender: TestLoopSender<ClientActorInner>,
     pub view_client_sender: TestLoopSender<ViewClientActorInner>,
-    pub tx_processor_sender: TestLoopSender<TxRequestHandler>,
+    pub rpc_handler_sender: TestLoopSender<RpcHandler>,
     pub shards_manager_sender: TestLoopSender<ShardsManagerActor>,
     pub partial_witness_sender: TestLoopSender<PartialWitnessActor>,
     pub peer_manager_sender: TestLoopSender<TestLoopPeerManagerActor>,
+    pub resharding_sender: TestLoopSender<ReshardingActor>,
     pub state_sync_dumper_handle: TestLoopDataHandle<StateSyncDumper>,
+    pub chunk_executor_sender: TestLoopSender<ChunkExecutorActor>,
 }
 
 impl From<&NodeExecutionData> for AccountId {
@@ -122,12 +127,18 @@ impl From<&NodeExecutionData> for Sender<ShardsManagerRequestFromNetwork> {
 
 impl From<&NodeExecutionData> for TxRequestHandleSenderForTestLoopNetwork {
     fn from(data: &NodeExecutionData) -> TxRequestHandleSenderForTestLoopNetwork {
-        data.tx_processor_sender.clone().with_delay(NETWORK_DELAY).into_multi_sender()
+        data.rpc_handler_sender.clone().with_delay(NETWORK_DELAY).into_multi_sender()
     }
 }
 
 impl From<&NodeExecutionData> for Sender<TestLoopNetworkBlockInfo> {
     fn from(data: &NodeExecutionData) -> Sender<TestLoopNetworkBlockInfo> {
         data.peer_manager_sender.clone().with_delay(NETWORK_DELAY).into_sender()
+    }
+}
+
+impl From<&NodeExecutionData> for Sender<ExecutorIncomingReceipts> {
+    fn from(data: &NodeExecutionData) -> Sender<ExecutorIncomingReceipts> {
+        data.chunk_executor_sender.clone().with_delay(NETWORK_DELAY).into_sender()
     }
 }

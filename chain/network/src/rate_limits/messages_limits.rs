@@ -202,7 +202,7 @@ fn get_key_and_token_cost(message: &PeerMessage) -> Option<(RateLimitedPeerMessa
         PeerMessage::Block(_) => Some((Block, 1)),
         PeerMessage::OptimisticBlock(_) => Some((OptimisticBlock, 1)),
         PeerMessage::Transaction(_) => Some((Transaction, 1)),
-        PeerMessage::Routed(msg) => match msg.body {
+        PeerMessage::Routed(msg) => match msg.body() {
             RoutedMessageBody::BlockApproval(_) => Some((BlockApproval, 1)),
             RoutedMessageBody::ForwardTx(_) => Some((ForwardTx, 1)),
             RoutedMessageBody::TxStatusRequest(_, _) => Some((TxStatusRequest, 1)),
@@ -236,6 +236,7 @@ fn get_key_and_token_cost(message: &PeerMessage) -> Option<(RateLimitedPeerMessa
             RoutedMessageBody::_UnusedEpochSyncRequest => None,
             RoutedMessageBody::_UnusedEpochSyncResponse(_) => None,
             RoutedMessageBody::StatePartRequest(_) => None, // TODO
+            RoutedMessageBody::StateHeaderRequest(_) => None, // TODO
             RoutedMessageBody::Ping(_)
             | RoutedMessageBody::Pong(_)
             | RoutedMessageBody::_UnusedChunkEndorsement

@@ -26,7 +26,7 @@ fn test_producer_with_expired_transactions() {
     let validators_spec = ValidatorsSpec::desired_roles(&[chunk_producer], &validators);
     let genesis = TestLoopBuilder::new_genesis_builder()
         .epoch_length(10)
-        .shard_layout(ShardLayout::simple_v1(&[]))
+        .shard_layout(ShardLayout::multi_shard_custom(vec![], 1))
         .validators_spec(validators_spec)
         .add_user_accounts_simple(&accounts, 1_000_000 * ONE_NEAR)
         .genesis_height(10000)
@@ -79,7 +79,7 @@ fn test_producer_with_expired_transactions() {
             );
             let process_tx_request =
                 ProcessTxRequest { transaction: tx, is_forwarded: false, check_only: false };
-            chunk_producer.tx_processor_sender.send(process_tx_request);
+            chunk_producer.rpc_handler_sender.send(process_tx_request);
         });
     }
 
@@ -142,7 +142,7 @@ fn test_producer_with_expired_transactions() {
     };
     let [metric] = applied_tx_metric.get_metric() else { panic!("unexpected metric shape") };
     let applied_txs = metric.get_counter().get_value();
-    assert_eq!(applied_txs, 70.0, "should have applied the submitted transactions");
+    assert_eq!(applied_txs, 76.0, "should have applied the submitted transactions");
 
     test_loop_env.shutdown_and_drain_remaining_events(Duration::seconds(20));
 }

@@ -18,7 +18,6 @@ use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::TryLockError;
 
 use super::Trie;
 use super::TrieCachingStorage;
@@ -60,15 +59,6 @@ impl Error for SnapshotError {}
 impl From<SnapshotError> for StorageError {
     fn from(err: SnapshotError) -> Self {
         StorageError::StorageInconsistentState(err.to_string())
-    }
-}
-
-impl<T> From<TryLockError<T>> for SnapshotError {
-    fn from(err: TryLockError<T>) -> Self {
-        match err {
-            TryLockError::Poisoned(_) => SnapshotError::Other("Poisoned lock".to_string()),
-            TryLockError::WouldBlock => SnapshotError::LockWouldBlock,
-        }
     }
 }
 
@@ -195,26 +185,6 @@ pub const STATE_SNAPSHOT_COLUMNS: &[DBCol] = &[
 type ShardIndexesAndUIds = Vec<(ShardIndex, ShardUId)>;
 
 impl ShardTries {
-    /// Returns the status of the given shard of flat storage in the state snapshot.
-    /// `sync_prev_prev_hash` needs to match the block hash that identifies that snapshot.
-    pub fn get_snapshot_flat_storage_status(
-        &self,
-        sync_prev_prev_hash: CryptoHash,
-        shard_uid: ShardUId,
-    ) -> Result<FlatStorageStatus, StorageError> {
-        let guard = self.state_snapshot().try_read().map_err(SnapshotError::from)?;
-        let data = guard.as_ref().ok_or(SnapshotError::SnapshotNotFound(sync_prev_prev_hash))?;
-        if &data.prev_block_hash != &sync_prev_prev_hash {
-            Err(SnapshotError::IncorrectSnapshotRequested(
-                sync_prev_prev_hash,
-                data.prev_block_hash,
-            )
-            .into())
-        } else {
-            Ok(data.flat_storage_manager.get_flat_storage_status(shard_uid))
-        }
-    }
-
     pub fn get_trie_nodes_for_part_from_snapshot(
         &self,
         shard_uid: ShardUId,
@@ -226,7 +196,7 @@ impl ShardTries {
         nibbles_end: Vec<u8>,
         state_trie: Trie,
     ) -> Result<PartialState, StorageError> {
-        let guard = self.state_snapshot().try_read().map_err(SnapshotError::from)?;
+        let guard = self.state_snapshot().try_read().ok_or(SnapshotError::LockWouldBlock)?;
         let data = guard.as_ref().ok_or(SnapshotError::SnapshotNotFound(*block_hash))?;
         if &data.prev_block_hash != block_hash {
             return Err(SnapshotError::IncorrectSnapshotRequested(
@@ -274,7 +244,7 @@ impl ShardTries {
         };
 
         // `write()` lock is held for the whole duration of this function.
-        let mut state_snapshot_lock = self.state_snapshot().write().unwrap();
+        let mut state_snapshot_lock = self.state_snapshot().write();
         let db_snapshot_hash = self.store().get_state_snapshot_hash();
         if let Some(state_snapshot) = &*state_snapshot_lock {
             // only return Ok() when the hash stored in STATE_SNAPSHOT_KEY and in state_snapshot_lock and prev_block_hash are the same
@@ -337,7 +307,7 @@ impl ShardTries {
         };
 
         // get snapshot_hash after acquiring write lock
-        let mut state_snapshot_lock = self.state_snapshot().write().unwrap();
+        let mut state_snapshot_lock = self.state_snapshot().write();
         if state_snapshot_lock.is_some() {
             // Drop Store before deleting the underlying data.
             *state_snapshot_lock = None;
@@ -417,7 +387,7 @@ impl ShardTries {
         let flat_storage_manager = FlatStorageManager::new(store.flat_store());
 
         let shard_indexes_and_uids = get_shard_indexes_and_uids_fn(snapshot_hash)?;
-        let mut guard = self.state_snapshot().write().unwrap();
+        let mut guard = self.state_snapshot().write();
         *guard = Some(StateSnapshot::new(
             store,
             snapshot_hash,

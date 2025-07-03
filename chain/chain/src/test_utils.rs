@@ -1,16 +1,13 @@
-mod kv_runtime;
-mod validator_schedule;
-
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::DoomslugThresholdMode;
 use crate::block_processing_utils::BlockNotInPoolError;
 use crate::chain::Chain;
 use crate::rayon_spawner::RayonAsyncComputationSpawner;
 use crate::runtime::NightshadeRuntime;
 use crate::store::ChainStoreAccess;
 use crate::types::{AcceptedBlock, ChainConfig, ChainGenesis};
+use crate::{ApplyChunksSpawner, DoomslugThresholdMode};
 use crate::{BlockProcessingArtifact, Provenance};
 use near_async::time::Clock;
 use near_chain_configs::{Genesis, MutableConfigValue};
@@ -32,8 +29,6 @@ use near_store::test_utils::create_test_store;
 use num_rational::Ratio;
 use tracing::debug;
 
-pub use self::kv_runtime::{KeyValueRuntime, MockEpochManager, account_id_to_shard_id};
-pub use self::validator_schedule::ValidatorSchedule;
 use near_async::messaging::{IntoMultiSender, noop};
 
 pub fn get_chain(clock: Clock) -> Chain {
@@ -77,7 +72,7 @@ pub fn get_chain_with_epoch_length_and_num_shards(
         DoomslugThresholdMode::NoApprovals,
         ChainConfig::test(),
         None,
-        Arc::new(RayonAsyncComputationSpawner),
+        ApplyChunksSpawner::Custom(Arc::new(RayonAsyncComputationSpawner)),
         MutableConfigValue::new(None, "validator_signer"),
         noop().into_multi_sender(),
     )
@@ -94,8 +89,8 @@ pub fn is_block_in_processing(chain: &Chain, block_hash: &CryptoHash) -> bool {
     chain.blocks_in_processing.contains(&BlockToApply::Normal(*block_hash))
 }
 
-pub fn is_optimistic_block_in_processing(chain: &Chain, block_hash: &CryptoHash) -> bool {
-    chain.blocks_in_processing.contains(&BlockToApply::Optimistic(*block_hash))
+pub fn is_optimistic_block_in_processing(chain: &Chain, block_height: u64) -> bool {
+    chain.blocks_in_processing.contains(&BlockToApply::Optimistic(block_height))
 }
 
 pub fn wait_for_block_in_processing(
@@ -109,16 +104,15 @@ pub fn wait_for_block_in_processing(
 /// finishes
 pub fn process_block_sync(
     chain: &mut Chain,
-    me: &Option<AccountId>,
-    block: MaybeValidated<Block>,
+    block: MaybeValidated<Arc<Block>>,
     provenance: Provenance,
     block_processing_artifacts: &mut BlockProcessingArtifact,
 ) -> Result<Vec<AcceptedBlock>, Error> {
     let block_hash = *block.hash();
-    chain.start_process_block_async(me, block, provenance, block_processing_artifacts, None)?;
+    chain.start_process_block_async(block, provenance, block_processing_artifacts, None)?;
     wait_for_block_in_processing(chain, &block_hash).unwrap();
     let (accepted_blocks, errors) =
-        chain.postprocess_ready_blocks(me, block_processing_artifacts, None);
+        chain.postprocess_ready_blocks(block_processing_artifacts, None);
     // This is in test, we should never get errors when postprocessing blocks
     debug_assert!(errors.is_empty());
     Ok(accepted_blocks)
@@ -166,12 +160,12 @@ pub fn setup_with_tx_validity_period(
         DoomslugThresholdMode::NoApprovals,
         ChainConfig::test(),
         None,
-        Arc::new(RayonAsyncComputationSpawner),
+        ApplyChunksSpawner::Custom(Arc::new(RayonAsyncComputationSpawner)),
         MutableConfigValue::new(None, "validator_signer"),
         noop().into_multi_sender(),
     )
     .unwrap();
-
+    chain.init_flat_storage().unwrap();
     let signer = Arc::new(create_test_signer("test"));
     (chain, epoch_manager, runtime, signer)
 }
@@ -231,7 +225,7 @@ pub fn display_chain(me: &Option<AccountId>, chain: &mut Chain, tail: bool) {
                 }
             );
             if let Some(block) = maybe_block {
-                for chunk_header in block.chunks().iter_deprecated() {
+                for chunk_header in block.chunks().iter() {
                     let chunk_producer = epoch_manager
                         .get_chunk_producer_info(&ChunkProductionKey {
                             epoch_id,

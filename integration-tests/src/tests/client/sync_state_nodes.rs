@@ -25,8 +25,9 @@ use near_primitives::utils::MaybeValidated;
 use near_store::DBCol;
 use near_store::adapter::StoreUpdateAdapter;
 use nearcore::{load_test_config, start_with_config};
+use parking_lot::RwLock;
 use std::ops::ControlFlow;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::env::nightshade_setup::TestEnvNightshadeSetupExt;
 use crate::env::test_env::TestEnv;
@@ -34,7 +35,7 @@ use crate::utils::test_helpers::heavy_test;
 
 /// One client is in front, another must sync to it using state (fast) sync.
 #[test]
-fn ultra_slow_test_sync_state_nodes() {
+fn slow_test_sync_state_nodes() {
     heavy_test(|| {
         init_integration_logger();
 
@@ -64,7 +65,7 @@ fn ultra_slow_test_sync_state_nodes() {
 
             WaitOrTimeoutActor::new(
                 Box::new(move |_ctx| {
-                    if view_client2_holder.read().unwrap().is_none() {
+                    if view_client2_holder.read().is_none() {
                         let view_client2_holder2 = view_client2_holder.clone();
                         let arbiters_holder2 = arbiters_holder2.clone();
                         let genesis2 = genesis.clone();
@@ -74,9 +75,8 @@ fn ultra_slow_test_sync_state_nodes() {
                         let actor = actor.then(move |res| {
                             match &res {
                                 Ok(Ok(b)) if b.header.height >= 101 => {
-                                    let mut view_client2_holder2 =
-                                        view_client2_holder2.write().unwrap();
-                                    let mut arbiters_holder2 = arbiters_holder2.write().unwrap();
+                                    let mut view_client2_holder2 = view_client2_holder2.write();
+                                    let mut arbiters_holder2 = arbiters_holder2.write();
 
                                     if view_client2_holder2.is_none() {
                                         let mut near2 =
@@ -107,7 +107,7 @@ fn ultra_slow_test_sync_state_nodes() {
                         actix::spawn(actor);
                     }
 
-                    if let Some(view_client2) = &*view_client2_holder.write().unwrap() {
+                    if let Some(view_client2) = &*view_client2_holder.write() {
                         let actor = view_client2.send(GetBlock::latest().with_span_context());
                         let actor = actor.then(|res| {
                             match &res {
@@ -206,7 +206,7 @@ fn ultra_slow_test_sync_state_nodes_multishard() {
 
             WaitOrTimeoutActor::new(
                 Box::new(move |_ctx| {
-                    if view_client2_holder.read().unwrap().is_none() {
+                    if view_client2_holder.read().is_none() {
                         let view_client2_holder2 = view_client2_holder.clone();
                         let arbiter_holder2 = arbiter_holder2.clone();
                         let genesis2 = genesis.clone();
@@ -216,9 +216,8 @@ fn ultra_slow_test_sync_state_nodes_multishard() {
                         let actor = actor.then(move |res| {
                             match &res {
                                 Ok(Ok(b)) if b.header.height >= 101 => {
-                                    let mut view_client2_holder2 =
-                                        view_client2_holder2.write().unwrap();
-                                    let mut arbiter_holder2 = arbiter_holder2.write().unwrap();
+                                    let mut view_client2_holder2 = view_client2_holder2.write();
+                                    let mut arbiter_holder2 = arbiter_holder2.write();
 
                                     if view_client2_holder2.is_none() {
                                         let mut near2 = load_test_config("test2", port2, genesis2);
@@ -256,7 +255,7 @@ fn ultra_slow_test_sync_state_nodes_multishard() {
                         actix::spawn(actor);
                     }
 
-                    if let Some(view_client2) = &*view_client2_holder.write().unwrap() {
+                    if let Some(view_client2) = &*view_client2_holder.write() {
                         let actor = view_client2.send(GetBlock::latest().with_span_context());
                         let actor = actor.then(|res| {
                             match &res {
@@ -355,7 +354,7 @@ fn ultra_slow_test_sync_state_dump() {
             let arbiters_holder2 = arbiters_holder;
 
             wait_or_timeout(1000, 120000, || async {
-                if view_client2_holder.read().unwrap().is_none() {
+                if view_client2_holder.read().is_none() {
                     let view_client2_holder2 = view_client2_holder.clone();
                     let arbiters_holder2 = arbiters_holder2.clone();
                     let genesis2 = genesis.clone();
@@ -363,8 +362,8 @@ fn ultra_slow_test_sync_state_dump() {
                     match view_client1.send(GetBlock::latest().with_span_context()).await {
                         // FIXME: this is not the right check after the sync hash was moved to sync the current epoch's state
                         Ok(Ok(b)) if b.header.height >= genesis.config.epoch_length + 2 => {
-                            let mut view_client2_holder2 = view_client2_holder2.write().unwrap();
-                            let mut arbiters_holder2 = arbiters_holder2.write().unwrap();
+                            let mut view_client2_holder2 = view_client2_holder2.write();
+                            let mut arbiters_holder2 = arbiters_holder2.write();
 
                             if view_client2_holder2.is_none() {
                                 let mut near2 = load_test_config("test2", port2, genesis2);
@@ -411,7 +410,7 @@ fn ultra_slow_test_sync_state_dump() {
                     return ControlFlow::Continue(());
                 }
 
-                if let Some(view_client2) = &*view_client2_holder.write().unwrap() {
+                if let Some(view_client2) = &*view_client2_holder.write() {
                     match view_client2.send(GetBlock::latest().with_span_context()).await {
                         Ok(Ok(b)) if b.header.height >= 40 => {
                             return ControlFlow::Break(());
@@ -531,7 +530,7 @@ fn ultra_slow_test_dump_epoch_missing_chunk_in_last_block() {
                     *genesis_block.hash(),
                 );
                 assert_eq!(
-                    env.tx_request_handlers[0].process_tx(tx, false, false),
+                    env.rpc_handlers[0].process_tx(tx, false, false),
                     ProcessTxResponse::ValidTx
                 );
             }
@@ -748,7 +747,7 @@ fn slow_test_state_sync_headers() {
                 tracing::info!(?sync_hash, ?shard_ids, "got sync_hash");
 
                 for shard_id in shard_ids {
-                    // Make StateRequestHeader and expect that the response contains a header and `can_generate` is true.
+                    // Make StateRequestHeader and expect that the response contains a header.
                     let state_response_info = match view_client1
                         .send(StateRequestHeader { shard_id, sync_hash }.with_span_context())
                         .await
@@ -761,25 +760,15 @@ fn slow_test_state_sync_headers() {
                         None => return ControlFlow::Continue(()),
                     };
                     let state_response = state_response_info.take_state_response();
-                    let can_generate = state_response.can_generate();
                     assert!(state_response.part().is_none());
-                    if let Some(_header) = state_response.take_header() {
-                        if !can_generate {
-                            tracing::info!(
-                                ?sync_hash,
-                                ?shard_id,
-                                can_generate,
-                                "got header but cannot generate"
-                            );
-                            return ControlFlow::Continue(());
-                        }
-                        tracing::info!(?sync_hash, ?shard_id, can_generate, "got header");
+                    if state_response.has_header() {
+                        tracing::info!(?sync_hash, %shard_id, "got header");
                     } else {
-                        tracing::info!(?sync_hash, ?shard_id, can_generate, "got no header");
+                        tracing::info!(?sync_hash, %shard_id, "got no header");
                         return ControlFlow::Continue(());
                     }
 
-                    // Make StateRequestPart and expect that the response contains a part and `can_generate` is true and part_id = 0 and the node has all parts cached.
+                    // Make StateRequestPart and expect that the response contains a part and part_id = 0 and the node has all parts cached.
                     let state_response_info = match view_client1
                         .send(
                             StateRequestPart { shard_id, sync_hash, part_id: 0 }
@@ -795,24 +784,16 @@ fn slow_test_state_sync_headers() {
                         None => return ControlFlow::Continue(()),
                     };
                     let state_response = state_response_info.take_state_response();
-                    let cached_parts = state_response.cached_parts().clone();
-                    let can_generate = state_response.can_generate();
-                    let part = state_response.part().clone();
-                    assert!(state_response.take_header().is_none());
+                    assert!(!state_response.has_header());
+                    let part = state_response.take_part();
                     if let Some((part_id, _part)) = part {
-                        if !can_generate || cached_parts != None || part_id != 0 {
-                            tracing::info!(
-                                ?sync_hash,
-                                ?shard_id,
-                                can_generate,
-                                part_id,
-                                "got part but shard info is unexpected"
-                            );
+                        if part_id != 0 {
+                            tracing::info!(?sync_hash, %shard_id, part_id, "got wrong part");
                             return ControlFlow::Continue(());
                         }
-                        tracing::info!(?sync_hash, ?shard_id, can_generate, part_id, "got part");
+                        tracing::info!(?sync_hash, %shard_id, part_id, "got part");
                     } else {
-                        tracing::info!(?sync_hash, ?shard_id, can_generate, "got no part");
+                        tracing::info!(?sync_hash, %shard_id, "got no part");
                         return ControlFlow::Continue(());
                     }
                 }
@@ -931,7 +912,7 @@ fn slow_test_state_sync_headers_no_tracked_shards() {
                 tracing::info!(?sync_hash, ?shard_ids, "got sync_hash");
 
                 for shard_id in shard_ids {
-                    // Make StateRequestHeader and expect that the response contains a header and `can_generate` is true.
+                    // Make StateRequestHeader and expect that the response contains a header.
                     let state_response_info = match view_client2
                         .send(StateRequestHeader { shard_id, sync_hash }.with_span_context())
                         .await
@@ -945,12 +926,10 @@ fn slow_test_state_sync_headers_no_tracked_shards() {
                     };
                     tracing::info!(?state_response_info, "got header state response");
                     let state_response = state_response_info.take_state_response();
-                    assert_eq!(state_response.cached_parts(), &None);
-                    assert!(!state_response.can_generate());
                     assert!(state_response.part().is_none());
-                    assert_eq!(state_response.take_header(), None);
+                    assert!(!state_response.has_header());
 
-                    // Make StateRequestPart and expect that the response contains a part and `can_generate` is true and part_id = 0 and the node has all parts cached.
+                    // Make StateRequestPart and expect that the response contains a part and part_id = 0 and the node has all parts cached.
                     let state_response_info = match view_client2
                         .send(
                             StateRequestPart { shard_id, sync_hash, part_id: 0 }
@@ -967,10 +946,8 @@ fn slow_test_state_sync_headers_no_tracked_shards() {
                     };
                     tracing::info!(?state_response_info, "got state part response");
                     let state_response = state_response_info.take_state_response();
-                    assert_eq!(state_response.cached_parts(), &None);
-                    assert!(!state_response.can_generate());
                     assert!(state_response.part().is_none());
-                    assert_eq!(state_response.take_header(), None);
+                    assert!(!state_response.has_header());
                 }
                 return ControlFlow::Break(());
             })

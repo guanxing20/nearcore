@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use actix::Addr;
+use parking_lot::RwLock;
 use rocksdb::DB;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -102,7 +103,7 @@ pub async fn build_streamer_message(
         })
         .collect::<Vec<_>>();
 
-    for chunk in chunks.into_iter() {
+    for chunk in chunks {
         let views::ChunkView { transactions, author, header, receipts: chunk_non_local_receipts } =
             chunk;
 
@@ -134,6 +135,7 @@ pub async fn build_streamer_message(
                 .filter(|tx| tx.transaction.signer_id == tx.transaction.receiver_id)
                 .collect::<Vec<&IndexerTransactionWithOutcome>>(),
             &block,
+            protocol_config_view.protocol_version,
         )
         .await?;
 
@@ -143,15 +145,7 @@ pub async fn build_streamer_message(
                 debug_assert!(outcome.receipt.is_none());
                 outcome.receipt = Some(receipt.clone());
             } else {
-                if let Ok(mut cache) = DELAYED_LOCAL_RECEIPTS_CACHE.write() {
-                    cache.insert(receipt.receipt_id, receipt.clone());
-                } else {
-                    tracing::warn!(
-                        target: INDEXER,
-                        "Unable to insert receipt {} into DELAYED_LOCAL_RECEIPTS_CACHE",
-                        receipt.receipt_id,
-                    );
-                }
+                DELAYED_LOCAL_RECEIPTS_CACHE.write().insert(receipt.receipt_id, receipt.clone());
             }
         }
 
@@ -164,23 +158,8 @@ pub async fn build_streamer_message(
                 receipt
             } else {
                 // Attempt to extract the receipt or decide to fetch it based on cache access success
-                let maybe_receipt = {
-                    match DELAYED_LOCAL_RECEIPTS_CACHE.write() {
-                        Ok(mut cache) => {
-                            // Lock acquired, attempt to remove the receipt
-                            cache.remove(&execution_outcome.id)
-                        }
-                        Err(_) => {
-                            // Failed to acquire lock, log this event and decide to fetch the receipt
-                            tracing::warn!(
-                                target: INDEXER,
-                                "Failed to acquire DELAYED_LOCAL_RECEIPTS_CACHE lock, starting to look for receipt {} in up to 1000 blocks back in time",
-                                execution_outcome.id,
-                            );
-                            None // Indicate that receipt needs to be fetched
-                        }
-                    }
-                };
+                let maybe_receipt =
+                    DELAYED_LOCAL_RECEIPTS_CACHE.write().remove(&execution_outcome.id);
 
                 // Depending on whether you got the receipt from the cache, proceed
                 if let Some(receipt) = maybe_receipt {
@@ -340,6 +319,7 @@ async fn find_local_receipt_by_id_in_block(
 ) -> Result<Option<views::ReceiptView>, FailedToFetchData> {
     let chunks = fetch_block_new_chunks(&client, &block, shard_tracker).await?;
 
+    let protocol_config_view = fetch_protocol_config(&client, block.header.hash).await?;
     let mut shards_outcomes = fetch_outcomes(&client, block.header.hash).await?;
 
     for chunk in chunks {
@@ -366,6 +346,7 @@ async fn find_local_receipt_by_id_in_block(
                 &runtime_config,
                 vec![&indexer_transaction],
                 &block,
+                protocol_config_view.protocol_version,
             )
             .await?;
 
@@ -450,7 +431,8 @@ pub(crate) async fn start(
         for block_height in start_syncing_block_height..=latest_block_height {
             metrics::CURRENT_BLOCK_HEIGHT.set(block_height as i64);
             if let Ok(block) = fetch_block_by_height(&view_client, block_height).await {
-                let response = build_streamer_message(&view_client, block, &shard_tracker).await;
+                let response =
+                    Box::pin(build_streamer_message(&view_client, block, &shard_tracker)).await;
 
                 match response {
                     Ok(streamer_message) => {

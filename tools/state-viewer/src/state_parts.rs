@@ -107,6 +107,7 @@ impl StatePartsSubCommand {
         let shard_tracker = ShardTracker::new(
             near_config.client_config.tracked_shards_config.clone(),
             epoch_manager.clone(),
+            near_config.validator_signer.clone(),
         );
         let runtime = NightshadeRuntime::from_config(
             home_dir,
@@ -124,6 +125,7 @@ impl StatePartsSubCommand {
             &chain_genesis,
             DoomslugThresholdMode::TwoThirds,
             false,
+            near_config.validator_signer.clone(),
         )
         .unwrap();
         let chain_id = &near_config.genesis.config.chain_id;
@@ -330,7 +332,7 @@ async fn load_state_parts(
     part_id: Option<u64>,
     maybe_state_root: Option<StateRoot>,
     maybe_sync_hash: Option<CryptoHash>,
-    chain: &mut Chain,
+    chain: &Chain,
     chain_id: &str,
     store: Store,
     external: &ExternalConnection,
@@ -375,7 +377,7 @@ async fn load_state_parts(
     tracing::info!(
         target: "state-parts",
         epoch_height,
-        ?shard_id,
+        %shard_id,
         num_parts,
         ?sync_hash,
         ?part_ids,
@@ -476,7 +478,7 @@ async fn dump_state_parts(
         target: "state-parts",
         epoch_height,
         epoch_id = ?epoch_id.0,
-        ?shard_id,
+        %shard_id,
         num_parts,
         ?sync_hash,
         ?part_ids,

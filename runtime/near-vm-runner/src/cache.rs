@@ -10,12 +10,13 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use near_parameters::vm::VMKind;
 use near_primitives_core::hash::CryptoHash;
 use near_schema_checker_lib::ProtocolSchema;
+use parking_lot::Mutex;
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[cfg(not(windows))]
 use rand::Rng as _;
@@ -44,8 +45,10 @@ fn vm_hash(vm_kind: VMKind) -> u64 {
         VMKind::Wasmtime => panic!("Wasmtime is not enabled"),
         #[cfg(all(feature = "near_vm", target_arch = "x86_64"))]
         VMKind::NearVm => crate::near_vm_runner::near_vm_vm_hash(),
+        #[cfg(all(feature = "near_vm", target_arch = "x86_64"))]
+        VMKind::NearVm2 => crate::near_vm_2_runner::near_vm_vm_hash(),
         #[cfg(not(all(feature = "near_vm", target_arch = "x86_64")))]
-        VMKind::NearVm => panic!("NearVM is not enabled"),
+        VMKind::NearVm | VMKind::NearVm2 => panic!("NearVM is not enabled"),
 
         VMKind::Wasmer0 | VMKind::Wasmer2 => unreachable!(),
     }
@@ -179,18 +182,18 @@ pub struct MockContractRuntimeCache {
 
 impl MockContractRuntimeCache {
     pub fn len(&self) -> usize {
-        self.store.lock().unwrap().len()
+        self.store.lock().len()
     }
 }
 
 impl ContractRuntimeCache for MockContractRuntimeCache {
     fn put(&self, key: &CryptoHash, value: CompiledContractInfo) -> std::io::Result<()> {
-        self.store.lock().unwrap().insert(*key, value);
+        self.store.lock().insert(*key, value);
         Ok(())
     }
 
     fn get(&self, key: &CryptoHash) -> std::io::Result<Option<CompiledContractInfo>> {
-        Ok(self.store.lock().unwrap().get(key).map(Clone::clone))
+        Ok(self.store.lock().get(key).map(Clone::clone))
     }
 
     fn handle(&self) -> Box<dyn ContractRuntimeCache> {
@@ -200,7 +203,7 @@ impl ContractRuntimeCache for MockContractRuntimeCache {
 
 impl fmt::Debug for MockContractRuntimeCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.store.lock().unwrap();
+        let guard = self.store.lock();
         let hm: &HashMap<_, _> = &*guard;
         fmt::Debug::fmt(hm, f)
     }
@@ -475,7 +478,7 @@ impl AnyCache {
 
     pub fn clear(&self) {
         if let Some(cache) = &self.cache {
-            cache.lock().unwrap().clear();
+            cache.lock().clear();
         }
     }
 
@@ -535,7 +538,7 @@ impl AnyCache {
             return Ok(with(&*v));
         };
         {
-            let mut guard = cache.lock().unwrap();
+            let mut guard = cache.lock();
             if let Some(cached_value) = guard.get(&key) {
                 // Same here.
                 return Ok(with(&**cached_value));
@@ -544,7 +547,7 @@ impl AnyCache {
         let generated = generate()?;
         let result = with(&*generated);
         {
-            let mut guard = cache.lock().unwrap();
+            let mut guard = cache.lock();
             guard.put(key, generated);
         }
         Ok(result)
@@ -553,7 +556,7 @@ impl AnyCache {
     /// Checks if the cache contains the key without modifying the cache.
     pub fn contains(&self, key: CryptoHash) -> bool {
         let Some(cache) = &self.cache else { return false };
-        let guard = cache.lock().unwrap();
+        let guard = cache.lock();
         guard.contains(&key)
     }
 }

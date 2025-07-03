@@ -35,7 +35,9 @@ fn slow_test_in_memory_trie_node_consistency() {
     let mut clock = FakeClock::new(Utc::UNIX_EPOCH);
 
     let epoch_length = 9000;
-    let shard_layout = ShardLayout::simple_v1(&["account3", "account5", "account7"]);
+    let boundary_accounts =
+        ["account3", "account5", "account7"].iter().map(|a| a.parse().unwrap()).collect();
+    let shard_layout = ShardLayout::multi_shard_custom(boundary_accounts, 1);
     let validators_spec = ValidatorsSpec::desired_roles(&["account0", "account1"], &[]);
 
     let genesis = TestGenesisBuilder::new()
@@ -203,13 +205,11 @@ fn get_block_producer(env: &TestEnv, head: &Tip, height_offset: u64) -> AccountI
 }
 
 fn check_block_does_not_have_missing_chunks(block: &Block) {
-    for chunk in block.chunks().iter_deprecated() {
-        if !chunk.is_new_chunk(block.header().height()) {
-            panic!(
-                "Block at height {} is produced without all chunks; the test setup is faulty",
-                block.header().height()
-            );
-        }
+    if block.chunks().iter_old().count() > 0 {
+        panic!(
+            "Block at height {} is produced without all chunks; the test setup is faulty",
+            block.header().height()
+        );
     }
 }
 
@@ -221,7 +221,7 @@ fn check_block_does_not_have_missing_chunks(block: &Block) {
 /// root mismatch issue, the two nodes would not be able to apply each others'
 /// blocks because the block hashes would be different.
 fn run_chain_for_some_blocks_while_sending_money_around(
-    clock: &mut FakeClock,
+    clock: &FakeClock,
     env: &mut TestEnv,
     nonces: &mut HashMap<AccountId, u64>,
     balances: &mut HashMap<AccountId, u128>,
@@ -259,7 +259,7 @@ fn run_chain_for_some_blocks_while_sending_money_around(
                 );
                 // Process the txn in all shards, because they may not always
                 // get a chance to produce the txn if they don't track the shard.
-                for tx_processor in &env.tx_request_handlers {
+                for tx_processor in &env.rpc_handlers {
                     match tx_processor.process_tx(txn.clone(), false, false) {
                         ProcessTxResponse::NoResponse => panic!("No response"),
                         ProcessTxResponse::InvalidTx(err) => panic!("Invalid tx: {}", err),
@@ -332,7 +332,7 @@ fn run_chain_for_some_blocks_while_sending_money_around(
             }
         }
 
-        for chunk in block_processed.chunks().iter_deprecated() {
+        for chunk in block_processed.chunks().iter() {
             let mut chunks_found = 0;
             for i in 0..env.clients.len() {
                 let client = &env.clients[i];
@@ -387,15 +387,7 @@ fn run_chain_for_some_blocks_while_sending_money_around(
 /// Returns the number of memtrie roots for the given client and shard, or
 /// None if that shard does not load memtries.
 fn num_memtrie_roots(env: &TestEnv, client_id: usize, shard: ShardUId) -> Option<usize> {
-    Some(
-        env.clients[client_id]
-            .runtime_adapter
-            .get_tries()
-            .get_memtries(shard)?
-            .read()
-            .unwrap()
-            .num_roots(),
-    )
+    Some(env.clients[client_id].runtime_adapter.get_tries().get_memtries(shard)?.read().num_roots())
 }
 
 /// Base case for testing in-memory tries consistency with state sync.
@@ -416,7 +408,9 @@ fn test_in_memory_trie_consistency_with_state_sync_base_case(track_all_shards: b
 
     let mut clock = FakeClock::new(Utc::UNIX_EPOCH);
 
-    let shard_layout = ShardLayout::simple_v1(&["account3", "account5", "account7"]);
+    let boundary_accounts =
+        ["account3", "account5", "account7"].iter().map(|a| a.parse().unwrap()).collect();
+    let shard_layout = ShardLayout::multi_shard_custom(boundary_accounts, 1);
     let validators_spec = ValidatorsSpec::desired_roles(
         &accounts[0..NUM_VALIDATORS].iter().map(|a| a.as_str()).collect::<Vec<_>>(),
         &[],

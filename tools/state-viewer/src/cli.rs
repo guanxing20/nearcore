@@ -120,11 +120,12 @@ pub enum StateViewerSubCommand {
     ViewTrie(ViewTrieCmd),
     /// Tools for manually validating state witnesses.
     ///
-    /// First, dump some of the latest stored state witnesses to a directory
+    /// First, dump some of the stored state witnesses to a directory
     /// using the `dump` command. Supports selecting by given height, shard
     /// and epoch id, or pretty-printing on screen.
-    /// Note that witnesses are only stored when `save_latest_witnesses` is
-    /// set to true in config.json.
+    ///
+    /// Note that witnesses are only stored when `save_latest_witnesses`
+    /// or `save_invalid_witnesses` are set to true in config.json.
     ///
     /// Second, validate a particular state witness from a file using the
     /// `validate` command.
@@ -137,6 +138,7 @@ pub enum StateViewerSubCommand {
 }
 
 impl StateViewerSubCommand {
+    #[allow(clippy::large_stack_frames)]
     pub fn run(
         self,
         home_dir: &Path,
@@ -293,7 +295,11 @@ pub enum ApplyRangeMode {
     /// Applies chunks one after another in order of increasing heights.
     ///
     /// Great for profiling.
-    Sequential,
+    Sequential {
+        /// If true, saves state transitions for state witness generation.
+        #[clap(long)]
+        save_state_transitions: bool,
+    },
     /// Applies chunks in parallel.
     ///
     /// Useful for quick correctness check of applying chunks by comparing
@@ -339,6 +345,7 @@ impl ApplyRangeCmd {
         }
         apply_range(
             self.mode,
+            self.storage,
             self.start_index,
             self.end_index,
             self.shard_id,
@@ -349,7 +356,6 @@ impl ApplyRangeCmd {
             store,
             self.save_state.map(|temperature| initialize_write_store(temperature, node_storage)),
             self.only_contracts,
-            self.storage,
         );
     }
 }

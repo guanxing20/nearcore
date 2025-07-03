@@ -12,6 +12,7 @@ use near_async::time;
 use near_crypto::PublicKey;
 use near_o11y::log_assert;
 use near_primitives::network::PeerId;
+use near_primitives::types::AccountId;
 use rand::seq::IteratorRandom as _;
 use rand::seq::SliceRandom as _;
 use std::collections::{HashMap, HashSet};
@@ -23,9 +24,6 @@ impl super::NetworkState {
         &self,
         accounts_data: &AccountDataCacheSnapshot,
     ) -> Option<FrozenValidatorConfig> {
-        if self.config.tier1.is_none() {
-            return None;
-        }
         let signer = self.config.validator.signer.get();
         if signer
             .as_ref()
@@ -215,11 +213,7 @@ impl super::NetworkState {
     /// Closes TIER1 connections from nodes which are not TIER1 any more.
     /// If this node is TIER1, it additionally connects to proxies of other TIER1 nodes.
     pub async fn tier1_connect(self: &Arc<Self>, clock: &time::Clock) {
-        let tier1_cfg = match &self.config.tier1 {
-            Some(it) => it,
-            None => return,
-        };
-        if !tier1_cfg.enable_outbound {
+        if !self.config.tier1.enable_outbound {
             return;
         }
         let accounts_data = self.accounts_data.load();
@@ -314,7 +308,7 @@ impl super::NetworkState {
                 }
                 // Bound the number of connections established at a single call to
                 // tier1_connect().
-                if handles.len() as u64 >= tier1_cfg.new_connections_per_attempt {
+                if handles.len() as u64 >= self.config.tier1.new_connections_per_attempt {
                     break;
                 }
                 // If we are already connected to some proxy of account_key, then
@@ -371,6 +365,26 @@ impl super::NetworkState {
             if let Some(conn) = tier1.ready.get(&proxy.peer_id) {
                 return Some(conn.clone());
             }
+        }
+        None
+    }
+
+    /// Finds a TIER1 connection for the given AccountId. Currently used only for OptimisticBlock,
+    /// which is implemented as a PeerMessage but has targets identified by AccountId.
+    /// TODO(saketh): consider simplifying things by changing the message type of OptimisticBlock.
+    pub fn get_tier1_proxy_for_account_id(
+        &self,
+        account_id: &AccountId,
+    ) -> Option<Arc<connection::Connection>> {
+        let accounts_data = self.accounts_data.load();
+        for key in accounts_data.keys_by_id.get(account_id).iter().flat_map(|keys| keys.iter()) {
+            let Some(data) = accounts_data.data.get(key) else {
+                continue;
+            };
+            let Some(conn) = self.get_tier1_proxy(data) else {
+                continue;
+            };
+            return Some(conn);
         }
         None
     }

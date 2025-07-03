@@ -268,7 +268,7 @@ pub(crate) fn validate_receipt(
 ) -> Result<(), ReceiptValidationError> {
     if mode == ValidateReceiptMode::NewReceipt {
         let receipt_size: u64 =
-            borsh::to_vec(receipt).unwrap().len().try_into().expect("Can't convert usize to u64");
+            borsh::object_length(receipt).unwrap().try_into().expect("Can't convert usize to u64");
         if receipt_size > limit_config.max_receipt_size {
             return Err(ReceiptValidationError::ReceiptSizeExceeded {
                 size: receipt_size,
@@ -732,7 +732,7 @@ mod tests {
                 return;
             }
         };
-        let cost = match tx_cost(config, &validated_tx.to_tx(), gas_price) {
+        let cost = match tx_cost(config, &validated_tx.to_tx(), gas_price, PROTOCOL_VERSION) {
             Ok(c) => c,
             Err(err) => {
                 assert_eq!(InvalidTxError::from(err), expected_err);
@@ -776,7 +776,8 @@ mod tests {
         };
         let (mut signer, mut access_key) = get_signer_and_access_key(state_update, &validated_tx)?;
 
-        let transaction_cost = tx_cost(config, &validated_tx.to_tx(), gas_price)?;
+        let transaction_cost =
+            tx_cost(config, &validated_tx.to_tx(), gas_price, current_protocol_version)?;
         let vr = verify_and_charge_tx_ephemeral(
             config,
             &mut signer,

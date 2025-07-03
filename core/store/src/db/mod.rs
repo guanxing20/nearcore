@@ -1,4 +1,4 @@
-use crate::DBCol;
+use crate::{DBCol, deserialized_column};
 use near_fmt::{AbbrBytes, StorageKey};
 use std::collections::HashSet;
 use std::io;
@@ -10,7 +10,7 @@ pub mod metadata;
 mod mixeddb;
 mod recoverydb;
 pub mod refcount;
-pub(crate) mod rocksdb;
+pub mod rocksdb;
 mod slice;
 mod splitdb;
 mod testdb;
@@ -42,7 +42,9 @@ pub const STATE_SNAPSHOT_KEY: &[u8; 18] = b"STATE_SNAPSHOT_KEY";
 // `DBCol::Misc` keys
 pub const FLAT_STATE_VALUES_INLINING_MIGRATION_STATUS_KEY: &[u8] =
     b"FLAT_STATE_VALUES_INLINING_MIGRATION_STATUS";
+pub const TRIE_STATE_RESHARDING_STATUS_KEY: &[u8] = b"TRIE_STATE_RESHARDING_STATUS";
 pub const LATEST_WITNESSES_INFO: &[u8] = b"LATEST_WITNESSES_INFO";
+pub const INVALID_WITNESSES_INFO: &[u8] = b"INVALID_WITNESSES_INFO";
 
 #[derive(Default, Debug)]
 pub struct DBTransaction {
@@ -260,6 +262,10 @@ pub trait Database: Sync + Send {
     /// Otherwise return None.
     fn copy_if_test(&self, _columns_to_keep: Option<&[DBCol]>) -> Option<Arc<dyn Database>> {
         None
+    }
+
+    fn deserialized_column_cache(&self) -> Arc<deserialized_column::Cache> {
+        deserialized_column::Cache::disabled()
     }
 }
 

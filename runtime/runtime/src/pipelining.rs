@@ -14,11 +14,13 @@ use near_primitives::receipt::{Receipt, ReceiptEnum};
 use near_primitives::trie_key::{GlobalContractCodeIdentifier, TrieKey};
 use near_primitives::types::{AccountId, Gas};
 use near_store::contract::ContractStorage;
+use near_store::trie::AccessOptions;
 use near_store::{KeyLookupMode, TrieUpdate, get_pure};
 use near_vm_runner::logic::GasCounter;
 use near_vm_runner::{ContractRuntimeCache, PreparedContract};
+use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) struct ReceiptPreparationPipeline {
@@ -178,9 +180,11 @@ impl ReceiptPreparationPipeline {
                                     global_contract_account_id.clone(),
                                 ),
                             };
-                            let Ok(Some(value_ref)) = state_update
-                                .get_ref_no_side_effects(&key, KeyLookupMode::MemOrFlatOrTrie)
-                            else {
+                            let Ok(Some(value_ref)) = state_update.get_ref(
+                                &key,
+                                KeyLookupMode::MemOrFlatOrTrie,
+                                AccessOptions::NO_SIDE_EFFECTS,
+                            ) else {
                                 continue;
                             };
                             value_ref.value_hash()
@@ -205,7 +209,7 @@ impl ReceiptPreparationPipeline {
                     PIPELINING_ACTIONS_SUBMITTED.inc_by(1);
                     rayon::spawn_fifo(move || {
                         let task_status = {
-                            let mut status = task.status.lock().expect("mutex lock");
+                            let mut status = task.status.lock();
                             std::mem::replace(&mut *status, PrepareTaskStatus::Working)
                         };
                         let PrepareTaskStatus::Pending = task_status else {
@@ -223,7 +227,7 @@ impl ReceiptPreparationPipeline {
                             &method_name,
                         );
 
-                        let mut status = task.status.lock().expect("mutex lock");
+                        let mut status = task.status.lock();
                         *status = PrepareTaskStatus::Prepared(contract);
                         PIPELINING_ACTIONS_TASK_WORKING_TIME.inc_by(start.elapsed().as_secs_f64());
                         task.condvar.notify_all();
@@ -300,7 +304,7 @@ impl ReceiptPreparationPipeline {
             PIPELINING_ACTIONS_MAIN_THREAD_WORKING_TIME.inc_by(start.elapsed().as_secs_f64());
             return result;
         };
-        let mut status_guard = task.status.lock().unwrap();
+        let mut status_guard = task.status.lock();
         loop {
             let current = std::mem::replace(&mut *status_guard, PrepareTaskStatus::Working);
             match current {
@@ -333,7 +337,7 @@ impl ReceiptPreparationPipeline {
                 }
                 PrepareTaskStatus::Working => {
                     let start = Instant::now();
-                    status_guard = task.condvar.wait(status_guard).unwrap();
+                    task.condvar.wait(&mut status_guard);
                     PIPELINING_ACTIONS_WAITING_TIME.inc_by(start.elapsed().as_secs_f64());
                     continue;
                 }
@@ -344,8 +348,6 @@ impl ReceiptPreparationPipeline {
                 }
                 PrepareTaskStatus::Finished => {
                     *status_guard = PrepareTaskStatus::Finished;
-                    // Don't poison the lock.
-                    drop(status_guard);
                     panic!("attempting to get_contract that has already been taken");
                 }
             }

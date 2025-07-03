@@ -93,7 +93,7 @@ impl Scenario {
                 if !self.is_fuzzing {
                     // fuzzing can generate invalid transactions
                     assert_eq!(
-                        env.tx_request_handlers[0].process_tx(signed_tx, false, false),
+                        env.rpc_handlers[0].process_tx(signed_tx, false, false),
                         ProcessTxResponse::ValidTx
                     );
                 }
@@ -103,7 +103,8 @@ impl Scenario {
 
             last_block = env.clients[0]
                 .produce_block(block.height)?
-                .ok_or_else(|| Error::Other(String::from("No block has been produced")))?;
+                .ok_or_else(|| Error::Other(String::from("No block has been produced")))?
+                .into();
             env.process_block(0, last_block.clone(), Provenance::PRODUCED);
 
             block_stats.block_production_time = start_time.elapsed();

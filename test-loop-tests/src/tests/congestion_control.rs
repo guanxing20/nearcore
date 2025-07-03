@@ -74,7 +74,9 @@ fn setup(accounts: &Vec<AccountId>) -> (TestLoopEnv, AccountId) {
     let [rpc_id] = rpcs else { panic!("Expected exactly one rpc node") };
 
     let epoch_length = 10;
-    let shard_layout = ShardLayout::simple_v1(&["account3", "account5", "account7"]);
+    let boundary_accounts =
+        ["account3", "account5", "account7"].iter().map(|a| a.parse().unwrap()).collect();
+    let shard_layout = ShardLayout::multi_shard_custom(boundary_accounts, 1);
     let validators_spec = ValidatorsSpec::desired_roles(&producers, &validators);
 
     let genesis = TestLoopBuilder::new_genesis_builder()
@@ -145,7 +147,7 @@ fn do_call_contract(
 /// The condition that can be used for the test loop to wait until the chain
 /// height is greater than the target height.
 fn height_condition(
-    test_loop_data: &mut TestLoopData,
+    test_loop_data: &TestLoopData,
     client_handle: &TestLoopDataHandle<ClientActorInner>,
     target_height: BlockHeight,
 ) -> bool {

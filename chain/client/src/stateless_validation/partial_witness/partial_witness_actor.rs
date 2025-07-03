@@ -45,7 +45,7 @@ use crate::client_actor::ClientSenderForPartialWitness;
 use crate::metrics;
 use crate::stateless_validation::state_witness_tracker::ChunkStateWitnessTracker;
 use crate::stateless_validation::validate::{
-    validate_chunk_contract_accesses, validate_contract_code_request,
+    ChunkRelevance, validate_chunk_contract_accesses, validate_contract_code_request,
     validate_partial_encoded_contract_deploys, validate_partial_encoded_state_witness,
 };
 
@@ -202,11 +202,15 @@ impl PartialWitnessActor {
             main_transition_shard_id,
         } = msg;
 
-        tracing::debug!(
+        let _span = tracing::debug_span!(
             target: "client",
-            chunk_hash=?state_witness.chunk_header.chunk_hash(),
             "distribute_chunk_state_witness",
-        );
+            chunk_hash=?state_witness.chunk_header().chunk_hash(),
+            height=state_witness.chunk_header().height_created(),
+            shard_id=%state_witness.chunk_header().shard_id(),
+            tag_block_production=true,
+        )
+        .entered();
 
         // We send the state-witness and contract-updates in the following order:
         // 1. We send the hashes of the contract code accessed (if contract code is excluded from witness and any contracts are called)
@@ -228,7 +232,7 @@ impl PartialWitnessActor {
                 key.clone(),
                 contract_accesses,
                 MainTransitionKey {
-                    block_hash: state_witness.main_state_transition.block_hash,
+                    block_hash: state_witness.main_state_transition().block_hash,
                     shard_id: main_transition_shard_id,
                 },
                 &chunk_validators,
@@ -239,7 +243,7 @@ impl PartialWitnessActor {
         let witness_bytes = compress_witness(&state_witness)?;
         self.send_state_witness_parts(
             key.epoch_id,
-            &state_witness.chunk_header,
+            state_witness.chunk_header(),
             witness_bytes,
             &chunk_validators,
             &signer,
@@ -260,12 +264,16 @@ impl PartialWitnessActor {
         chunk_validators: &[AccountId],
         signer: &ValidatorSigner,
     ) -> Vec<(AccountId, PartialEncodedStateWitness)> {
-        tracing::debug!(
+        let _span = tracing::debug_span!(
             target: "client",
-            chunk_hash=?chunk_header.chunk_hash(),
-            ?chunk_validators,
             "generate_state_witness_parts",
-        );
+            chunk_hash = ?chunk_header.chunk_hash(),
+            height = %chunk_header.height_created(),
+            shard_id = %chunk_header.shard_id(),
+            chunk_validators_len = chunk_validators.len(),
+            tag_witness_distribution = true,
+        )
+        .entered();
 
         // Break the state witness into parts using Reed Solomon encoding.
         let encoder = self.witness_encoders.entry(chunk_validators.len());
@@ -337,6 +345,16 @@ impl PartialWitnessActor {
         chunk_validators: &[AccountId],
         signer: &ValidatorSigner,
     ) {
+        let _span = tracing::debug_span!(
+            target: "client",
+            "send_state_witness_parts",
+            chunk_hash = ?chunk_header.chunk_hash(),
+            height = %chunk_header.height_created(),
+            shard_id = %chunk_header.shard_id(),
+            tag_witness_distribution = true,
+        )
+        .entered();
+
         // Capture these values first, as the sources are consumed before calling record_witness_sent.
         let chunk_hash = chunk_header.chunk_hash();
         let witness_size_in_bytes = witness_bytes.size_bytes();
@@ -358,7 +376,7 @@ impl PartialWitnessActor {
         // Record the witness in order to match the incoming acks for measuring round-trip times.
         // See process_chunk_state_witness_ack for the handling of the ack messages.
         self.state_witness_tracker.record_witness_sent(
-            chunk_hash,
+            chunk_hash.clone(),
             witness_size_in_bytes,
             validator_witness_tuple.len(),
         );
@@ -371,9 +389,18 @@ impl PartialWitnessActor {
 
     /// Function to handle receiving partial_encoded_state_witness message from chunk producer.
     fn handle_partial_encoded_state_witness(
-        &mut self,
+        &self,
         partial_witness: PartialEncodedStateWitness,
     ) -> Result<(), Error> {
+        let _span = tracing::debug_span!(
+            target: "client",
+            "handle_partial_encoded_state_witness",
+            height = partial_witness.chunk_production_key().height_created,
+            shard_id = %partial_witness.chunk_production_key().shard_id,
+            part_ord = partial_witness.part_ord(),
+            tag_witness_distribution = true,
+        )
+        .entered();
         tracing::debug!(target: "client", ?partial_witness, "Receive PartialEncodedStateWitnessMessage");
         let signer = self.my_validator_signer()?;
         let validator_account_id = signer.validator_id().clone();
@@ -407,7 +434,7 @@ impl PartialWitnessActor {
                 &validator_account_id,
                 runtime_adapter.store(),
             ) {
-                Ok(true) => {
+                Ok(ChunkRelevance::Relevant) => {
                     network_adapter.send(PeerManagerMessageRequest::NetworkRequests(
                         NetworkRequests::PartialEncodedStateWitnessForward(
                             target_chunk_validators,
@@ -415,7 +442,7 @@ impl PartialWitnessActor {
                         ),
                     ));
                 }
-                Ok(false) => {
+                Ok(_) => {
                     tracing::debug!(
                         target: "client",
                         chunk_production_key = ?partial_witness.chunk_production_key(),
@@ -439,9 +466,18 @@ impl PartialWitnessActor {
 
     /// Function to handle receiving partial_encoded_state_witness_forward message from chunk producer.
     fn handle_partial_encoded_state_witness_forward(
-        &mut self,
+        &self,
         partial_witness: PartialEncodedStateWitness,
     ) -> Result<(), Error> {
+        let _span = tracing::debug_span!(
+            target: "client",
+            "handle_partial_encoded_state_witness_forward",
+            height = partial_witness.chunk_production_key().height_created,
+            shard_id = %partial_witness.chunk_production_key().shard_id,
+            part_ord = partial_witness.part_ord(),
+            tag_witness_distribution = true,
+        )
+        .entered();
         tracing::debug!(target: "client", ?partial_witness, "Receive PartialEncodedStateWitnessForwardMessage");
 
         let signer = self.my_validator_signer()?;
@@ -459,12 +495,12 @@ impl PartialWitnessActor {
                     &validator_account_id,
                     runtime_adapter.store(),
                 ) {
-                    Ok(true) => {
+                    Ok(ChunkRelevance::Relevant) => {
                         if let Err(err) = partial_witness_tracker.store_partial_encoded_state_witness(partial_witness) {
                             tracing::error!(target: "client", "Failed to store partial encoded state witness: {}", err);
                         }
                     }
-                    Ok(false) => {
+                    Ok(_) => {
                         tracing::debug!(
                             target: "client",
                             chunk_production_key = ?partial_witness.chunk_production_key(),
@@ -502,7 +538,9 @@ impl PartialWitnessActor {
             self.epoch_manager.as_ref(),
             &partial_deploys,
             self.runtime.store(),
-        )? {
+        )?
+        .is_relevant()
+        {
             return Ok(());
         }
         if self.partial_deploys_tracker.already_processed(&partial_deploys) {
@@ -594,17 +632,16 @@ impl PartialWitnessActor {
     /// Handles contract code accesses message from chunk producer.
     /// This is sent in parallel to a chunk state witness and contains the hashes
     /// of the contract code accessed when applying the previous chunk of the witness.
-    fn handle_chunk_contract_accesses(
-        &mut self,
-        accesses: ChunkContractAccesses,
-    ) -> Result<(), Error> {
+    fn handle_chunk_contract_accesses(&self, accesses: ChunkContractAccesses) -> Result<(), Error> {
         let signer = self.my_validator_signer()?;
         if !validate_chunk_contract_accesses(
             self.epoch_manager.as_ref(),
             &accesses,
             &signer,
             self.runtime.store(),
-        )? {
+        )?
+        .is_relevant()
+        {
             return Ok(());
         }
         let key = accesses.chunk_production_key();
@@ -690,7 +727,7 @@ impl PartialWitnessActor {
         let contracts = contract_codes.into_iter().map(|contract| contract.into()).collect();
         let compressed_deploys = ChunkContractDeploys::compress_contracts(&contracts)?;
         let validator_parts = self.generate_contract_deploys_parts(&key, compressed_deploys)?;
-        for (part_owner, deploys_part) in validator_parts.into_iter() {
+        for (part_owner, deploys_part) in validator_parts {
             self.network_adapter.send(PeerManagerMessageRequest::NetworkRequests(
                 NetworkRequests::PartialEncodedContractDeploys(vec![part_owner], deploys_part),
             ));
@@ -706,7 +743,9 @@ impl PartialWitnessActor {
             self.epoch_manager.as_ref(),
             &request,
             self.runtime.store(),
-        )? {
+        )?
+        .is_relevant()
+        {
             return Ok(());
         }
 
@@ -768,7 +807,7 @@ impl PartialWitnessActor {
             }
             match storage.retrieve_raw_bytes(&contract_hash.0) {
                 Ok(bytes) => contracts.push(CodeBytes(bytes)),
-                Err(StorageError::MissingTrieValue(_, _)) => {
+                Err(StorageError::MissingTrieValue(_)) => {
                     tracing::warn!(
                         target: "client",
                         ?contract_hash,
@@ -788,10 +827,7 @@ impl PartialWitnessActor {
     }
 
     /// Handles contract code responses message from chunk producer.
-    fn handle_contract_code_response(
-        &mut self,
-        response: ContractCodeResponse,
-    ) -> Result<(), Error> {
+    fn handle_contract_code_response(&self, response: ContractCodeResponse) -> Result<(), Error> {
         let key = response.chunk_production_key().clone();
         let contracts = response.decompress_contracts()?;
         self.partial_witness_tracker.store_accessed_contract_codes(key, contracts)
@@ -806,7 +842,7 @@ impl PartialWitnessActor {
     }
 
     fn ordered_contract_deploys_validators(
-        &mut self,
+        &self,
         key: &ChunkProductionKey,
     ) -> Result<Vec<AccountId>, Error> {
         let chunk_producers = HashSet::<AccountId>::from_iter(
@@ -825,11 +861,26 @@ impl PartialWitnessActor {
 }
 
 fn compress_witness(witness: &ChunkStateWitness) -> Result<EncodedChunkStateWitness, Error> {
-    let shard_id_label = witness.chunk_header.shard_id().to_string();
+    let _span = tracing::debug_span!(
+        target: "client",
+        "compress_witness",
+        chunk_hash = ?witness.chunk_header().chunk_hash(),
+        height = %witness.chunk_header().height_created(),
+        shard_id = %witness.chunk_header().shard_id(),
+        tag_witness_distribution=true,
+    )
+    .entered();
+
+    let shard_id_label = witness.chunk_header().shard_id().to_string();
     let encode_timer = near_chain::stateless_validation::metrics::CHUNK_STATE_WITNESS_ENCODE_TIME
         .with_label_values(&[shard_id_label.as_str()])
         .start_timer();
-    let (witness_bytes, raw_witness_size) = EncodedChunkStateWitness::encode(witness)?;
+    let (witness_bytes, raw_witness_size) = if let ChunkStateWitness::V1(witness_v1) = witness {
+        // For V1 witness, we need to encode only the inner witness struct for backwards compatibility.
+        EncodedChunkStateWitness::encode(witness_v1)?
+    } else {
+        EncodedChunkStateWitness::encode(witness)?
+    };
     encode_timer.observe_duration();
 
     near_chain::stateless_validation::metrics::record_witness_size_metrics(

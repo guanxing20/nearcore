@@ -85,6 +85,12 @@ imports! {
     // # Finite-wasm internals #
     // #########################
     @in internal: finite_wasm_gas<[gas: u64] -> []>,
+    @in internal: finite_wasm_memory_copy<[cnt: u32, lin: u64, constant: u64] -> [u32]>,
+    @in internal: finite_wasm_memory_fill<[cnt: u32, lin: u64, constant: u64] -> [u32]>,
+    @in internal: finite_wasm_memory_init<[cnt: u32, lin: u64, constant: u64] -> [u32]>,
+    @in internal: finite_wasm_table_copy<[cnt: u32, lin: u64, constant: u64] -> [u32]>,
+    @in internal: finite_wasm_table_fill<[cnt: u32, lin: u64, constant: u64] -> [u32]>,
+    @in internal: finite_wasm_table_init<[cnt: u32, lin: u64, constant: u64] -> [u32]>,
     @in internal: finite_wasm_stack<[operand_size: u64, frame_size: u64] -> []>,
     @in internal: finite_wasm_unstack<[operand_size: u64, frame_size: u64] -> []>,
     // #############
@@ -170,6 +176,10 @@ imports! {
     // #######################
     promise_batch_action_create_account<[promise_index: u64] -> []>,
     promise_batch_action_deploy_contract<[promise_index: u64, code_len: u64, code_ptr: u64] -> []>,
+    #[global_contract_host_fns] promise_batch_action_deploy_global_contract<[promise_index: u64, code_len: u64, code_ptr: u64] -> []>,
+    #[global_contract_host_fns] promise_batch_action_deploy_global_contract_by_account_id<[promise_index: u64, code_len: u64, code_ptr: u64] -> []>,
+    #[global_contract_host_fns] promise_batch_action_use_global_contract<[promise_index: u64, code_hash_len: u64, code_hash_ptr: u64] -> []>,
+    #[global_contract_host_fns] promise_batch_action_use_global_contract_by_account_id<[promise_index: u64, account_id_len: u64, account_id_ptr: u64] -> []>,
     promise_batch_action_function_call<[
         promise_index: u64,
         method_name_len: u64,

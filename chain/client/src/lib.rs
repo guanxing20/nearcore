@@ -8,15 +8,15 @@ pub use near_client_primitives::types::{
     QueryError, Status, StatusResponse, SyncStatus, TxStatus, TxStatusError,
 };
 
-pub use crate::client::Client;
+pub use crate::client::{AsyncComputationMultiSpawner, Client};
 #[cfg(feature = "test_features")]
 pub use crate::client_actor::NetworkAdversarialMessage;
 pub use crate::client_actor::{ClientActor, StartClientResult, start_client};
 pub use crate::config_updater::ConfigUpdater;
-pub use crate::stateless_validation::chunk_validator::orphan_witness_handling::HandleOrphanWitnessOutcome;
-pub use crate::tx_request_handler::{
-    TxRequestHandler, TxRequestHandlerActor, TxRequestHandlerConfig, spawn_tx_request_handler_actor,
+pub use crate::rpc_handler::{
+    RpcHandler, RpcHandlerActor, RpcHandlerConfig, spawn_rpc_handler_actor,
 };
+pub use crate::stateless_validation::chunk_validator::orphan_witness_handling::HandleOrphanWitnessOutcome;
 pub use crate::view_client_actor::{ViewClientActor, ViewClientActorInner};
 pub use chunk_producer::ProduceChunkResult;
 pub use near_chain::stateless_validation::processing_tracker::{
@@ -33,6 +33,7 @@ pub use stateless_validation::partial_witness::partial_witness_actor::{
 pub mod adapter;
 pub mod adversarial;
 mod chunk_distribution_network;
+pub mod chunk_executor_actor;
 mod chunk_inclusion_tracker;
 mod chunk_producer;
 mod client;
@@ -42,9 +43,9 @@ pub mod debug;
 pub mod gc_actor;
 mod info;
 pub mod metrics;
+mod rpc_handler;
 mod stateless_validation;
 pub mod sync;
 pub mod sync_jobs_actor;
 pub mod test_utils;
-mod tx_request_handler;
 mod view_client_actor;

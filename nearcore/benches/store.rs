@@ -1,7 +1,4 @@
-#[macro_use]
-extern crate bencher;
-
-use bencher::Bencher;
+use bencher::{Bencher, benchmark_group, benchmark_main};
 use near_chain::{ChainStore, ChainStoreAccess, types::RuntimeAdapter};
 use near_chain_configs::GenesisValidationMode;
 use near_epoch_manager::EpochManager;
@@ -49,7 +46,7 @@ fn read_trie_items(bench: &mut Bencher, shard_index: ShardIndex, shard_id: Shard
         let head = chain_store.head().unwrap();
         let last_block = chain_store.get_block(&head.last_block_hash).unwrap();
         let state_roots: Vec<StateRoot> =
-            last_block.chunks().iter_deprecated().map(|chunk| chunk.prev_state_root()).collect();
+            last_block.chunks().iter().map(|chunk| chunk.prev_state_root()).collect();
         let header = last_block.header();
 
         let trie = runtime

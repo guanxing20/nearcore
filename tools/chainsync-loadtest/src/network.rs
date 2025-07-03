@@ -17,15 +17,17 @@ use near_network::types::{
 use near_network::types::{
     FullPeerInfo, NetworkInfo, NetworkRequests, PeerManagerAdapter, PeerManagerMessageRequest,
 };
+use near_o11y::span_wrapped_msg::SpanWrapped;
 use near_primitives::block::{Block, BlockHeader};
 use near_primitives::hash::CryptoHash;
 use near_primitives::sharding::ChunkHash;
 use near_primitives::sharding::ShardChunkHeader;
 use nearcore::config::NearConfig;
+use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 #[derive(Default, Debug)]
@@ -53,8 +55,8 @@ struct NetworkData {
 pub struct Network {
     pub stats: Stats,
     network_adapter: PeerManagerAdapter,
-    pub block_headers: Arc<WeakMap<CryptoHash, Once<Vec<BlockHeader>>>>,
-    pub blocks: Arc<WeakMap<CryptoHash, Once<Block>>>,
+    pub block_headers: Arc<WeakMap<CryptoHash, Once<Vec<Arc<BlockHeader>>>>>,
+    pub blocks: Arc<WeakMap<CryptoHash, Once<Arc<Block>>>>,
     pub chunks: Arc<WeakMap<ChunkHash, Once<PartialEncodedChunkResponseMsg>>>,
     data: Arc<Mutex<NetworkData>>,
 
@@ -138,7 +140,7 @@ impl Network {
     pub async fn info(self: &Arc<Self>) -> anyhow::Result<Arc<NetworkInfo>> {
         let (send, recv) = oneshot::channel();
         {
-            let mut n = self.data.lock().unwrap();
+            let mut n = self.data.lock();
             if n.info_.num_connected_peers >= self.min_peers {
                 let _ = send.send(n.info_.clone());
             } else {
@@ -155,7 +157,7 @@ impl Network {
     pub async fn fetch_block_headers(
         self: &Arc<Self>,
         hash: CryptoHash,
-    ) -> anyhow::Result<Vec<BlockHeader>> {
+    ) -> anyhow::Result<Vec<Arc<BlockHeader>>> {
         scope::run!(|s| async {
             self.stats.header_start.fetch_add(1, Ordering::Relaxed);
             let recv = self.block_headers.get_or_insert(&hash, || Once::new());
@@ -173,7 +175,7 @@ impl Network {
     }
 
     // fetch_block() fetches a block with a given hash.
-    pub async fn fetch_block(self: &Arc<Self>, hash: CryptoHash) -> anyhow::Result<Block> {
+    pub async fn fetch_block(self: &Arc<Self>, hash: CryptoHash) -> anyhow::Result<Arc<Block>> {
         scope::run!(|s| async {
             self.stats.block_start.fetch_add(1, Ordering::Relaxed);
             let recv = self.blocks.get_or_insert(&hash, || Once::new());
@@ -209,7 +211,7 @@ impl Network {
                         min_height: ch.height_included(),
                     },
                     request: PartialEncodedChunkRequestMsg {
-                        chunk_hash: ch.chunk_hash(),
+                        chunk_hash: ch.chunk_hash().clone(),
                         part_ords: (0..self.parts_per_chunk).collect(),
                         tracking_shards: Default::default(),
                     },
@@ -238,19 +240,23 @@ impl Network {
             block_approval: noop().into_sender(),
             block_request: Sender::from_async_fn(|_| None),
             block_headers_request: Sender::from_async_fn(|_| None),
-            block: Sender::from_async_fn(move |block: BlockResponse| {
+            block: Sender::from_async_fn(move |block: SpanWrapped<BlockResponse>| {
+                let block = block.span_unwrap();
                 blocks.get(&block.block.hash().clone()).map(|p| p.set(block.block));
             }),
-            block_headers: Sender::from_async_fn(move |headers: BlockHeadersResponse| {
-                if let Some(h) = headers.0.iter().min_by_key(|h| h.height()) {
-                    let hash = *h.prev_hash();
-                    block_headers.get(&hash).map(|p| p.set(headers.0));
-                }
-                Ok(())
-            }),
-            network_info: Sender::from_async_fn(move |info: SetNetworkInfo| {
-                let mut n = data.lock().unwrap();
-                n.info_ = Arc::new(info.0);
+            block_headers: Sender::from_async_fn(
+                move |headers: SpanWrapped<BlockHeadersResponse>| {
+                    let headers = headers.span_unwrap();
+                    if let Some(h) = headers.0.iter().min_by_key(|h| h.height()) {
+                        let hash = *h.prev_hash();
+                        block_headers.get(&hash).map(|p| p.set(headers.0));
+                    }
+                    Ok(())
+                },
+            ),
+            network_info: Sender::from_async_fn(move |info: SpanWrapped<SetNetworkInfo>| {
+                let mut n = data.lock();
+                n.info_ = Arc::new(info.span_unwrap().0);
                 if n.info_.num_connected_peers < min_peers {
                     info!("connected = {}/{}", n.info_.num_connected_peers, min_peers);
                     return;

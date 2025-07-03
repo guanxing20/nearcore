@@ -82,7 +82,7 @@ impl InfoHelper {
         client_config: &ClientConfig,
     ) -> Self {
         set_open_files_limit(0);
-        metrics::export_version(&client_config.version);
+        metrics::export_version(&client_config.chain_id, &client_config.version);
         InfoHelper {
             clock: clock.clone(),
             nearcore_version: client_config.version.clone(),
@@ -102,14 +102,14 @@ impl InfoHelper {
         }
     }
 
-    pub fn chunk_processed(&mut self, shard_id: ShardId, gas_used: Gas, balance_burnt: Balance) {
+    pub fn chunk_processed(&self, shard_id: ShardId, gas_used: Gas, balance_burnt: Balance) {
         metrics::TGAS_USAGE_HIST
             .with_label_values(&[&shard_id.to_string()])
             .observe(gas_used as f64 / TERAGAS);
         metrics::BALANCE_BURNT.inc_by(balance_burnt as f64);
     }
 
-    pub fn chunk_skipped(&mut self, shard_id: ShardId) {
+    pub fn chunk_skipped(&self, shard_id: ShardId) {
         metrics::CHUNK_SKIPPED_TOTAL.with_label_values(&[&shard_id.to_string()]).inc();
     }
 
@@ -148,11 +148,8 @@ impl InfoHelper {
         client: &crate::client::Client,
         shard_layout: &ShardLayout,
     ) {
-        let validator_signer = client.validator_signer.get();
-        let me = validator_signer.as_ref().map(|x| x.validator_id());
         for shard_id in shard_layout.shard_ids() {
-            let tracked =
-                client.shard_tracker.cares_about_shard(me, &head.prev_block_hash, shard_id, true);
+            let tracked = client.shard_tracker.cares_about_shard(&head.prev_block_hash, shard_id);
             metrics::TRACKED_SHARDS.with_label_values(&[&shard_id.to_string()]).set(if tracked {
                 1
             } else {
@@ -261,7 +258,7 @@ impl InfoHelper {
                 let chunk_producers_settlement = &epoch_info.chunk_producers_settlement();
                 let chunk_producers = chunk_producers_settlement.get(shard_index);
                 let Some(chunk_producers) = chunk_producers else {
-                    tracing::warn!(target: "stats", ?shard_id, ?chunk_producers_settlement, "invalid shard id, not found in the shard settlement");
+                    tracing::warn!(target: "stats", %shard_id, ?chunk_producers_settlement, "invalid shard id, not found in the shard settlement");
                     continue;
                 };
                 for &id in chunk_producers {
@@ -464,7 +461,7 @@ impl InfoHelper {
             config_updater.report_status();
         }
         let (cpu_usage, memory_usage) = proc_info.unwrap_or_default();
-        let is_validator = validator_info.map(|v| v.is_validator).unwrap_or_default();
+        let is_validator = validator_info.is_some_and(|v| v.is_validator);
         (metrics::IS_VALIDATOR.set(is_validator as i64));
         (metrics::RECEIVED_BYTES_PER_SECOND.set(network_info.received_bytes_per_sec as i64));
         (metrics::SENT_BYTES_PER_SECOND.set(network_info.sent_bytes_per_sec as i64));
@@ -623,7 +620,7 @@ impl InfoHelper {
         json
     }
 
-    fn log_chain_processing_info(&mut self, client: &crate::Client, epoch_id: &EpochId) {
+    fn log_chain_processing_info(&self, client: &crate::Client, epoch_id: &EpochId) {
         let chain = &client.chain;
         let use_color = matches!(self.log_summary_style, LogSummaryStyle::Colored);
         let info = chain.get_chain_processing_info();
@@ -809,7 +806,7 @@ impl std::fmt::Display for BlocksInfo {
             }
         };
 
-        for block_info in self.blocks_info.iter() {
+        for block_info in &self.blocks_info {
             let mut all_chunks_received = true;
             let chunk_status = block_info
                 .chunks_info
@@ -975,7 +972,6 @@ mod tests {
     use assert_matches::assert_matches;
     use near_async::messaging::{IntoMultiSender, IntoSender, noop};
     use near_async::time::Clock;
-    use near_chain::rayon_spawner::RayonAsyncComputationSpawner;
     use near_chain::runtime::NightshadeRuntime;
     use near_chain::types::ChainConfig;
     use near_chain::{Chain, ChainGenesis, DoomslugThresholdMode};
@@ -1032,7 +1028,7 @@ mod tests {
             doomslug_threshold_mode,
             ChainConfig::test(),
             None,
-            Arc::new(RayonAsyncComputationSpawner),
+            Default::default(),
             validator.clone(),
             noop().into_multi_sender(),
         )

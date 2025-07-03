@@ -6,7 +6,7 @@ use near_jsonrpc_primitives::types::changes::{
     RpcStateChangesInBlockByTypeRequest, RpcStateChangesInBlockByTypeResponse,
 };
 use near_jsonrpc_primitives::types::transactions::{
-    RpcTransactionResponse, RpcTransactionStatusRequest,
+    RpcSendTransactionRequest, RpcTransactionResponse, RpcTransactionStatusRequest,
 };
 use near_jsonrpc_primitives::types::validator::RpcValidatorsOrderedRequest;
 use near_primitives::hash::CryptoHash;
@@ -228,12 +228,21 @@ impl JsonRpcClient {
         call_method(&self.client, &self.server_addr, "EXPERIMENTAL_tx_status", request)
     }
 
+    #[deprecated(since = "2.7.0", note = "Use `changes` method instead")]
     #[allow(non_snake_case)]
     pub fn EXPERIMENTAL_changes(
         &self,
         request: RpcStateChangesInBlockByTypeRequest,
     ) -> RpcRequest<RpcStateChangesInBlockByTypeResponse> {
         call_method(&self.client, &self.server_addr, "EXPERIMENTAL_changes", request)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn changes(
+        &self,
+        request: RpcStateChangesInBlockByTypeRequest,
+    ) -> RpcRequest<RpcStateChangesInBlockByTypeResponse> {
+        call_method(&self.client, &self.server_addr, "changes", request)
     }
 
     #[allow(non_snake_case)]
@@ -278,6 +287,15 @@ impl JsonRpcClient {
             _ => EpochReference::Latest,
         };
         call_method(&self.client, &self.server_addr, "validators", epoch_reference)
+    }
+
+    pub fn send_tx(
+        &self,
+        signed_transaction: near_primitives::transaction::SignedTransaction,
+        wait_until: near_primitives::views::TxExecutionStatus,
+    ) -> RpcRequest<RpcTransactionResponse> {
+        let request = RpcSendTransactionRequest { signed_transaction, wait_until };
+        call_method(&self.client, &self.server_addr, "send_tx", request)
     }
 }
 

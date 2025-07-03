@@ -1,22 +1,23 @@
 use crate::config::Mode;
 use crate::db::{DBIterator, DBOp, DBSlice, DBTransaction, Database, StatsValue, refcount};
-use crate::{DBCol, StoreConfig, StoreStatistics, Temperature, metrics};
+use crate::{DBCol, StoreConfig, StoreStatistics, Temperature, deserialized_column, metrics};
 use ::rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, DB, Env, IteratorMode, Options, ReadOptions, WriteBatch,
 };
 use anyhow::Context;
 use itertools::Itertools;
+use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::io;
-use std::ops::Deref;
-use std::path::Path;
-use std::sync::LazyLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use strum::IntoEnumIterator;
 use tracing::warn;
 
 use super::metadata;
 
 mod instance_tracker;
-pub(crate) mod snapshot;
+pub mod snapshot;
 
 /// List of integer RocksDB properties we’re reading when collecting statistics.
 ///
@@ -48,6 +49,7 @@ static CF_PROPERTY_NAMES: LazyLock<Vec<std::ffi::CString>> = LazyLock::new(|| {
 pub struct RocksDB {
     db: DB,
     db_opt: Options,
+    cache: Arc<deserialized_column::Cache>,
 
     /// Map from [`DBCol`] to a column family handler in the RocksDB.
     ///
@@ -117,11 +119,17 @@ impl RocksDB {
         temp: Temperature,
         columns: &[DBCol],
     ) -> io::Result<Self> {
+        static MAP: Mutex<BTreeMap<PathBuf, Arc<deserialized_column::Cache>>> =
+            Mutex::new(BTreeMap::new());
+        let mut guard = MAP.lock();
+        let cache = guard
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(deserialized_column::Cache::enabled()));
         let counter = instance_tracker::InstanceTracker::try_new(store_config.max_open_files)
             .map_err(io::Error::other)?;
         let (db, db_opt) = Self::open_db(path, store_config, mode, temp, columns)?;
         let cf_handles = Self::get_cf_handles(&db, columns);
-        Ok(Self { db, db_opt, cf_handles, _instance_tracker: counter })
+        Ok(Self { db, db_opt, cf_handles, _instance_tracker: counter, cache: Arc::clone(cache) })
     }
 
     /// Opens the database with given column families configured.
@@ -492,6 +500,10 @@ impl Database for RocksDB {
         }
         Ok(())
     }
+
+    fn deserialized_column_cache(&self) -> Arc<deserialized_column::Cache> {
+        Arc::clone(&self.cache)
+    }
 }
 
 fn cf_descriptors(
@@ -666,7 +678,7 @@ impl RocksDB {
 
     /// Gets every int property in CF_PROPERTY_NAMES for every column in DBCol.
     fn get_cf_statistics(&self, result: &mut StoreStatistics) {
-        for prop_name in CF_PROPERTY_NAMES.deref() {
+        for prop_name in &*CF_PROPERTY_NAMES {
             let values = self
                 .cf_handles()
                 .filter_map(|(col, handle)| {
@@ -768,7 +780,7 @@ fn col_name(col: DBCol) -> &'static str {
         DBCol::ChallengedBlocks => "col17",
         DBCol::StateHeaders => "col18",
         DBCol::InvalidChunks => "col19",
-        DBCol::BlockExtra => "col20",
+        DBCol::_BlockExtra => "col20",
         DBCol::BlockPerHeight => "col21",
         DBCol::StateParts => "col22",
         DBCol::EpochStart => "col23",
@@ -813,12 +825,17 @@ mod tests {
 
     use super::*;
 
+    unsafe fn convert_db_to_rocksdb<'a>(db: &'a dyn Database) -> &'a RocksDB {
+        let ptr = db as *const _ as *const RocksDB;
+        unsafe { &*ptr }
+    }
+
     #[test]
     fn rocksdb_merge_sanity() {
         let (_tmp_dir, opener) = NodeStorage::test_opener();
         let store = opener.open().unwrap().get_hot_store();
-        let ptr = (&*store.storage) as *const (dyn Database + 'static);
-        let rocksdb = unsafe { &*(ptr as *const RocksDB) };
+        let database = store.database();
+        let rocksdb = unsafe { convert_db_to_rocksdb(database) };
         assert_eq!(store.get(DBCol::State, &[1; 8]).unwrap(), None);
         {
             let mut store_update = store.store_update();

@@ -128,7 +128,7 @@ impl HighLoadStatsCommand {
         stats.sort_by(|a, b| a.height.cmp(&b.height));
 
         BlockStats::print_header();
-        for stat in stats.into_iter() {
+        for stat in stats {
             stat.print();
         }
 
@@ -156,7 +156,7 @@ impl HighLoadStatsCommand {
         let mut tx_by_account = vec![0; 4];
         let mut receipts_by_account = vec![0; 4];
 
-        for (shard_index, chunk_header) in block.chunks().iter_deprecated().enumerate() {
+        for (shard_index, chunk_header) in block.chunks().iter().enumerate() {
             // Note that this doesn't work if there are missing chunks and resharding.
             let shard_id = chunk_header.shard_id();
             // let mut gas_usage_in_shard = GasUsageInShard::new();

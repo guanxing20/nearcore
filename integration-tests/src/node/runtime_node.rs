@@ -1,9 +1,10 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use near_chain_configs::Genesis;
 use near_crypto::{InMemorySigner, Signer};
 use near_parameters::{RuntimeConfig, RuntimeConfigStore};
-use near_primitives::types::AccountId;
+use near_primitives::types::{AccountId, Balance};
+use parking_lot::RwLock;
 use testlib::runtime_utils::{add_test_contract, alice_account, bob_account, carol_account};
 
 use crate::node::Node;
@@ -16,6 +17,7 @@ pub struct RuntimeNode {
     pub signer: Arc<Signer>,
     pub genesis: Genesis,
     account_id: AccountId,
+    gas_price: Balance,
 }
 
 impl RuntimeNode {
@@ -41,7 +43,8 @@ impl RuntimeNode {
             epoch_length: genesis.config.epoch_length,
             runtime_config,
         }));
-        RuntimeNode { signer, client, genesis, account_id: account_id.clone() }
+        let gas_price = genesis.config.min_gas_price;
+        RuntimeNode { signer, client, genesis, account_id: account_id.clone(), gas_price }
     }
 
     pub fn new_from_genesis(account_id: &AccountId, genesis: Genesis) -> Self {
@@ -70,6 +73,7 @@ impl RuntimeNode {
     pub fn free(account_id: &AccountId) -> Self {
         let mut genesis =
             Genesis::test(vec![alice_account(), bob_account(), "carol.near".parse().unwrap()], 3);
+        genesis.config.min_gas_price = 0;
         add_test_contract(&mut genesis, &bob_account());
         Self::new_from_genesis_and_config(account_id, genesis, RuntimeConfig::free())
     }
@@ -105,6 +109,7 @@ impl Node for RuntimeNode {
             self.account_id.clone(),
             self.signer.clone(),
             self.client.clone(),
+            self.gas_price,
         ))
     }
 }
@@ -123,7 +128,7 @@ mod tests {
         let node_user = node.user();
         let (alice1, bob1) = (node.view_balance(&alice).unwrap(), node.view_balance(&bob).unwrap());
         node_user.send_money(alice.clone(), bob.clone(), 1).unwrap();
-        let runtime_config = node.client.as_ref().read().unwrap().runtime_config.clone();
+        let runtime_config = node.client.as_ref().read().runtime_config.clone();
         let fee_helper = FeeHelper::new(runtime_config, node.genesis().config.min_gas_price);
         let transfer_cost = fee_helper.transfer_cost();
         let (alice2, bob2) = (node.view_balance(&alice).unwrap(), node.view_balance(&bob).unwrap());
