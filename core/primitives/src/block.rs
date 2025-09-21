@@ -3,6 +3,7 @@ use crate::block::BlockValidityError::{
     InvalidChunkHeaderRoot, InvalidChunkMask, InvalidReceiptRoot, InvalidStateRoot,
     InvalidTransactionRoot,
 };
+use crate::block_body::SpiceCoreStatement;
 use crate::block_body::{BlockBody, BlockBodyV1, ChunkEndorsementSignatures};
 pub use crate::block_header::*;
 use crate::challenge::Challenge;
@@ -122,19 +123,24 @@ impl Block {
         clock: near_time::Clock,
         sandbox_delta_time: Option<near_time::Duration>,
         optimistic_block: Option<OptimisticBlock>,
+        // TODO(spice): Change type to Vec<SpiceCoreStatement> once spice feature is tied to
+        // protocol version. We use option for now to indicate whether spice feature is enabled to
+        // allow creating non-spice blocks for tests.
+        core_statements: Option<Vec<SpiceCoreStatement>>,
     ) -> Self {
         // Collect aggregate of validators and gas usage/limits from chunks.
+
         let mut prev_validator_proposals = vec![];
-        let mut gas_used = 0;
+        let mut gas_used = Gas::ZERO;
         // This computation of chunk_mask relies on the fact that chunks are ordered by shard_id.
         let mut chunk_mask = vec![];
         let mut balance_burnt = 0;
-        let mut gas_limit = 0;
+        let mut gas_limit = Gas::ZERO;
         for chunk in &chunks {
             if chunk.height_included() == height {
                 prev_validator_proposals.extend(chunk.prev_validator_proposals());
-                gas_used += chunk.prev_gas_used();
-                gas_limit += chunk.gas_limit();
+                gas_used = gas_used.checked_add(chunk.prev_gas_used()).unwrap();
+                gas_limit = gas_limit.checked_add(chunk.gas_limit()).unwrap();
                 balance_burnt += chunk.prev_balance_burnt();
                 chunk_mask.push(true);
             } else {
@@ -218,7 +224,12 @@ impl Block {
         let chunk_headers_root = chunks_wrapper.compute_chunk_headers_root();
         let chunk_tx_root = chunks_wrapper.compute_chunk_tx_root();
         let outcome_root = chunks_wrapper.compute_outcome_root();
-        let body = BlockBody::new(chunks, vrf_value, vrf_proof, chunk_endorsements);
+
+        let body = if let Some(core_statements) = core_statements {
+            BlockBody::new_for_spice(chunks, vrf_value, vrf_proof, core_statements)
+        } else {
+            BlockBody::new(chunks, vrf_value, vrf_proof, chunk_endorsements)
+        };
 
         let header = BlockHeader::new(
             latest_protocol_version,
@@ -300,12 +311,12 @@ impl Block {
         max_gas_price: Balance,
     ) -> Balance {
         // If block was skipped, the price does not change.
-        if gas_limit == 0 {
+        if gas_limit == Gas::ZERO {
             return gas_price;
         }
 
-        let gas_used = u128::from(gas_used);
-        let gas_limit = u128::from(gas_limit);
+        let gas_used = u128::from(gas_used.as_gas());
+        let gas_limit = u128::from(gas_limit.as_gas());
         let adjustment_rate_numer = *gas_price_adjustment_rate.numer() as u128;
         let adjustment_rate_denom = *gas_price_adjustment_rate.denom() as u128;
 
@@ -372,6 +383,22 @@ impl Block {
         match self {
             Block::BlockV1(_) | Block::BlockV2(_) | Block::BlockV3(_) => &[],
             Block::BlockV4(block) => block.body.chunk_endorsements(),
+        }
+    }
+
+    #[inline]
+    pub fn spice_core_statements(&self) -> &[SpiceCoreStatement] {
+        match self {
+            Block::BlockV1(_) | Block::BlockV2(_) | Block::BlockV3(_) => &[],
+            Block::BlockV4(block) => block.body.spice_core_statements(),
+        }
+    }
+
+    #[inline]
+    pub fn is_spice_block(&self) -> bool {
+        match self {
+            Block::BlockV1(_) | Block::BlockV2(_) | Block::BlockV3(_) => false,
+            Block::BlockV4(block) => block.body.is_spice_block(),
         }
     }
 
@@ -619,11 +646,12 @@ impl<'a> Chunks<'a> {
     }
 
     pub fn compute_gas_used(&self) -> Gas {
-        self.iter_new().fold(0, |acc, chunk| acc + chunk.prev_gas_used())
+        self.iter_new()
+            .fold(Gas::ZERO, |acc, chunk| acc.checked_add(chunk.prev_gas_used()).unwrap())
     }
 
     pub fn compute_gas_limit(&self) -> Gas {
-        self.iter_new().fold(0, |acc, chunk| acc + chunk.gas_limit())
+        self.iter_new().fold(Gas::ZERO, |acc, chunk| acc.checked_add(chunk.gas_limit()).unwrap())
     }
 }
 

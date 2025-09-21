@@ -196,6 +196,8 @@ pub enum Parameter {
     AccountIdValidityRulesVersion,
     YieldTimeoutLengthInBlocks,
     MaxYieldPayloadSize,
+    MaxTablesPerContract,
+    MaxElementsPerContractTable,
 
     // Contract runtime features
     FlatStorageReads,
@@ -237,6 +239,8 @@ pub enum Parameter {
     ActionUseGlobalContract,
     ActionUseGlobalContractPerIdentifierByte,
     GlobalContractHostFns,
+
+    DeterministicAccountIds,
 }
 
 #[derive(
@@ -308,6 +312,8 @@ impl Parameter {
             Parameter::YieldTimeoutLengthInBlocks,
             Parameter::MaxYieldPayloadSize,
             Parameter::PerReceiptStorageProofSizeLimit,
+            Parameter::MaxTablesPerContract,
+            Parameter::MaxElementsPerContractTable,
         ]
         .iter()
     }

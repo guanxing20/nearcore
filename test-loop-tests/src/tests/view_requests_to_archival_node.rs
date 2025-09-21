@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use itertools::Itertools;
-use near_async::messaging::Handler;
+use near_async::messaging::{Handler, Message};
 use near_async::test_loop::TestLoopV2;
 use near_async::test_loop::data::TestLoopDataHandle;
 use near_async::time::Duration;
@@ -16,7 +16,7 @@ use near_o11y::testonly::init_test_logger;
 use near_primitives::shard_layout::ShardLayout;
 use near_primitives::sharding::ChunkHash;
 use near_primitives::types::{
-    AccountId, BlockHeight, BlockId, BlockReference, EpochId, EpochReference, Finality,
+    AccountId, BlockHeight, BlockId, BlockReference, EpochId, EpochReference, Finality, Gas,
     SyncCheckpoint,
 };
 use near_primitives::version::PROTOCOL_VERSION;
@@ -127,10 +127,11 @@ impl<'a> ViewClientTester<'a> {
     }
 
     /// Sends a message to the `[ViewClientActorInner]` for the client at position `idx`.
-    fn send<M: actix::Message>(&mut self, request: M, idx: usize) -> M::Result
+    fn send<M, R>(&mut self, request: M, idx: usize) -> R
     where
-        M::Result: Send,
-        ViewClientActorInner: Handler<M>,
+        M: Message,
+        R: Send,
+        ViewClientActorInner: Handler<M, R>,
     {
         let view_client = self.test_loop.data.get_mut(&self.handles[idx]);
         view_client.handle(request)
@@ -223,7 +224,7 @@ impl<'a> ViewClientTester<'a> {
 
         let mut get_and_check_chunk = |request: GetChunk| {
             let chunk = self.send(request, ARCHIVAL_CLIENT).unwrap();
-            assert_eq!(chunk.header.gas_limit, 1_000_000_000_000_000);
+            assert_eq!(chunk.header.gas_limit, Gas::from_teragas(1000));
             chunk
         };
 
@@ -248,7 +249,7 @@ impl<'a> ViewClientTester<'a> {
 
         let mut get_and_check_shard_chunk = |request: GetShardChunk| {
             let shard_chunk = self.send(request, ARCHIVAL_CLIENT).unwrap();
-            assert_eq!(shard_chunk.take_header().gas_limit(), 1_000_000_000_000_000);
+            assert_eq!(shard_chunk.take_header().gas_limit(), Gas::from_teragas(1000));
         };
 
         let chunk_by_height = GetShardChunk::Height(6, shard_id);

@@ -1,17 +1,17 @@
 use std::str::FromStr;
 
-use actix::{Actor, System};
+use actix::Actor;
 
 use futures::{FutureExt, TryFutureExt, future};
 
 use crate::tests::nearcore::node_cluster::NodeCluster;
 use crate::utils::genesis_helpers::genesis_block;
 use near_actix_test_utils::spawn_interruptible;
+use near_async::messaging::CanSendAsync;
 use near_client::GetBlock;
 use near_crypto::InMemorySigner;
 use near_jsonrpc::client::new_client;
 use near_network::test_utils::WaitOrTimeoutActor;
-use near_o11y::WithSpanContextExt;
 use near_o11y::testonly::init_integration_logger;
 use near_primitives::hash::CryptoHash;
 use near_primitives::serialize::to_base64;
@@ -40,7 +40,7 @@ fn slow_test_block_unknown_block_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = view_client.send_async(GetBlock::latest());
                 let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
@@ -58,7 +58,7 @@ fn slow_test_block_unknown_block_error() {
                                             error_json["cause"]["name"],
                                             serde_json::json!("UNKNOWN_BLOCK")
                                         );
-                                        System::current().stop();
+                                        near_async::shutdown_all_actors();
                                     })
                                     .map_ok(|_| panic!("The block mustn't be found"))
                                     .map(drop),
@@ -99,7 +99,7 @@ fn slow_test_chunk_unknown_chunk_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = view_client.send_async(GetBlock::latest());
                 let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
@@ -128,7 +128,7 @@ fn slow_test_chunk_unknown_chunk_error() {
                                                 "3tMcx4KU2KvkwJPMWPXqK2MUU1FDVbigPFNiAeuVa7Tu"
                                             )
                                         );
-                                        System::current().stop();
+                                        near_async::shutdown_all_actors();
                                     })
                                     .map_ok(|_| panic!("The chunk mustn't be found"))
                                     .map(drop),
@@ -168,7 +168,7 @@ fn slow_test_protocol_config_unknown_block_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = view_client.send_async(GetBlock::latest());
                 let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
@@ -191,7 +191,7 @@ fn slow_test_protocol_config_unknown_block_error() {
                                             error_json["cause"]["name"],
                                             serde_json::json!("UNKNOWN_BLOCK")
                                         );
-                                        System::current().stop();
+                                        near_async::shutdown_all_actors();
                                     })
                                     .map_ok(|_| panic!("The block mustn't be found"))
                                     .map(drop),
@@ -231,7 +231,7 @@ fn slow_test_gas_price_unknown_block_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = view_client.send_async(GetBlock::latest());
                 let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
@@ -250,7 +250,7 @@ fn slow_test_gas_price_unknown_block_error() {
                                             error_json["cause"]["name"],
                                             serde_json::json!("UNKNOWN_BLOCK")
                                         );
-                                        System::current().stop();
+                                        near_async::shutdown_all_actors();
                                     })
                                     .map_ok(|_| panic!("The block mustn't be found"))
                                     .map(drop),
@@ -290,7 +290,7 @@ fn slow_test_receipt_id_unknown_receipt_error() {
 
                 // We are sending this tx unstop, just to get over the warm up period.
                 // Probably make sense to stop after 1 time though.
-                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = view_client.send_async(GetBlock::latest());
                 let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 1 {
@@ -321,7 +321,7 @@ fn slow_test_receipt_id_unknown_receipt_error() {
                                                 "3tMcx4KU2KvkwJPMWPXqK2MUU1FDVbigPFNiAeuVa7Tu"
                                             )
                                         );
-                                        System::current().stop();
+                                        near_async::shutdown_all_actors();
                                     })
                                     .map_ok(|_| panic!("The block mustn't be found"))
                                     .map(drop),
@@ -374,7 +374,7 @@ fn test_tx_invalid_tx_error() {
                 let transaction_copy = transaction.clone();
                 let tx_hash = transaction_copy.get_hash();
 
-                let actor = view_client.send(GetBlock::latest().with_span_context());
+                let actor = view_client.send_async(GetBlock::latest());
                 let actor = actor.then(move |res| {
                     if let Ok(Ok(block)) = res {
                         if block.header.height > 10 {
@@ -398,7 +398,7 @@ fn test_tx_invalid_tx_error() {
                                             error_json["cause"]["info"]["transaction_hash"],
                                             serde_json::json!(tx_hash)
                                         );
-                                        System::current().stop();
+                                        near_async::shutdown_all_actors();
                                     })
                                     .map_ok(|_| panic!("The transaction mustn't succeed"))
                                     .map(drop),
@@ -446,6 +446,6 @@ fn test_query_rpc_account_view_unknown_block_must_return_error() {
         };
 
         assert_eq!(error["cause"]["name"], serde_json::json!("UNKNOWN_BLOCK"),);
-        System::current().stop();
+        near_async::shutdown_all_actors();
     });
 }

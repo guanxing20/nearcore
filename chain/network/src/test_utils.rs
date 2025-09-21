@@ -5,10 +5,9 @@ use crate::types::{
     SetChainInfo, StateSyncEvent, Tier3Request,
 };
 use actix::{Actor, ActorContext, Context, Handler};
-use futures::{Future, FutureExt, future};
+use futures::{Future, FutureExt};
 use near_async::messaging::{CanSend, MessageWithCallback};
 use near_crypto::{KeyType, SecretKey};
-use near_o11y::{WithSpanContext, handler_debug_span};
 use near_primitives::hash::hash;
 use near_primitives::network::PeerId;
 use near_primitives::types::EpochId;
@@ -36,16 +35,6 @@ pub fn convert_boot_nodes(boot_nodes: Vec<(&str, std::net::SocketAddr)>) -> Vec<
     result
 }
 
-/// Timeouts by stopping system without any condition and raises panic.
-/// Useful in tests to prevent them from running forever.
-#[allow(unreachable_code)]
-pub fn wait_or_panic(max_wait_ms: u64) {
-    actix::spawn(tokio::time::sleep(tokio::time::Duration::from_millis(max_wait_ms)).then(|_| {
-        panic!("Timeout exceeded.");
-        future::ready(())
-    }));
-}
-
 /// Waits until condition or timeouts with panic.
 /// Use in tests to check for a condition and stop or fail otherwise.
 ///
@@ -63,7 +52,7 @@ pub fn wait_or_panic(max_wait_ms: u64) {
 ///     WaitOrTimeoutActor::new(
 ///         Box::new(move |ctx| {
 ///             if start.elapsed() > Duration::from_millis(10) {
-///                 System::current().stop()
+///                 near_async::shutdown_all_actors();
 ///             }
 ///         }),
 ///         1000,
@@ -186,11 +175,10 @@ pub fn expected_routing_tables(
 #[rtype(result = "NetworkInfo")]
 pub struct GetInfo {}
 
-impl Handler<WithSpanContext<GetInfo>> for PeerManagerActor {
+impl Handler<GetInfo> for PeerManagerActor {
     type Result = crate::types::NetworkInfo;
 
-    fn handle(&mut self, msg: WithSpanContext<GetInfo>, _ctx: &mut Context<Self>) -> Self::Result {
-        let (_span, _msg) = handler_debug_span!(target: "network", msg);
+    fn handle(&mut self, _msg: GetInfo, _ctx: &mut Context<Self>) -> Self::Result {
         self.get_network_info()
     }
 }
@@ -208,15 +196,10 @@ impl StopSignal {
     }
 }
 
-impl Handler<WithSpanContext<StopSignal>> for PeerManagerActor {
+impl Handler<StopSignal> for PeerManagerActor {
     type Result = ();
 
-    fn handle(
-        &mut self,
-        msg: WithSpanContext<StopSignal>,
-        ctx: &mut Self::Context,
-    ) -> Self::Result {
-        let (_span, msg) = handler_debug_span!(target: "network", msg);
+    fn handle(&mut self, msg: StopSignal, ctx: &mut Self::Context) -> Self::Result {
         debug!(target: "network", "Receive Stop Signal.");
 
         if msg.should_panic {

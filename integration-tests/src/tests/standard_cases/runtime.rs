@@ -98,6 +98,12 @@ fn test_nonce_updated_when_tx_failed_runtime() {
 }
 
 #[test]
+fn test_regression_nonce_update_with_mixed_transactions_runtime() {
+    let node = create_runtime_node();
+    test_regression_nonce_update_with_mixed_transactions(node);
+}
+
+#[test]
 fn test_upload_contract_runtime() {
     let node = create_runtime_node();
     test_upload_contract(node);
@@ -147,6 +153,12 @@ fn test_trying_to_create_eth_implicit_account_runtime() {
 fn test_smart_contract_reward_runtime() {
     let node = create_runtime_node();
     test_smart_contract_reward(node);
+}
+
+#[test]
+fn test_transaction_invalid_signature_runtime() {
+    let node = create_runtime_node();
+    test_transaction_invalid_signature(node);
 }
 
 #[test]

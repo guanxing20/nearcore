@@ -1,7 +1,6 @@
-use near_async::actix_wrapper::SyncActixWrapper;
-use near_async::messaging;
 use near_async::messaging::CanSend;
 use near_async::messaging::Handler;
+use near_async::{ActorSystem, messaging};
 use near_chain::check_transaction_validity_period;
 use near_chain::types::RuntimeAdapter;
 use near_chain::types::Tip;
@@ -32,10 +31,15 @@ use std::sync::Arc;
 
 use crate::metrics;
 use crate::stateless_validation::chunk_endorsement::ChunkEndorsementTracker;
-
-pub type RpcHandlerActor = SyncActixWrapper<RpcHandler>;
+use near_async::multithread::MultithreadRuntimeHandle;
 
 impl Handler<ProcessTxRequest> for RpcHandler {
+    fn handle(&mut self, msg: ProcessTxRequest) {
+        Handler::<ProcessTxRequest, ProcessTxResponse>::handle(self, msg);
+    }
+}
+
+impl Handler<ProcessTxRequest, ProcessTxResponse> for RpcHandler {
     fn handle(&mut self, msg: ProcessTxRequest) -> ProcessTxResponse {
         let ProcessTxRequest { transaction, is_forwarded, check_only } = msg;
         self.process_tx(transaction, is_forwarded, check_only)
@@ -54,6 +58,7 @@ impl Handler<ChunkEndorsementMessage> for RpcHandler {
 impl messaging::Actor for RpcHandler {}
 
 pub fn spawn_rpc_handler_actor(
+    actor_system: ActorSystem,
     config: RpcHandlerConfig,
     tx_pool: Arc<Mutex<ShardedTransactionPool>>,
     chunk_endorsement_tracker: Arc<ChunkEndorsementTracker>,
@@ -62,7 +67,7 @@ pub fn spawn_rpc_handler_actor(
     validator_signer: MutableValidatorSigner,
     runtime: Arc<dyn RuntimeAdapter>,
     network_adapter: PeerManagerAdapter,
-) -> actix::Addr<RpcHandlerActor> {
+) -> MultithreadRuntimeHandle<RpcHandler> {
     let actor = RpcHandler::new(
         config.clone(),
         tx_pool,
@@ -73,7 +78,7 @@ pub fn spawn_rpc_handler_actor(
         runtime,
         network_adapter,
     );
-    actix::SyncArbiter::start(config.handler_threads, move || SyncActixWrapper::new(actor.clone()))
+    actor_system.spawn_multithread_actor(config.handler_threads, move || actor.clone())
 }
 
 #[derive(Clone)]

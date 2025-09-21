@@ -2,17 +2,16 @@ use std::collections::{HashMap, HashSet, hash_map};
 use std::sync::Arc;
 
 use itertools::Itertools;
-use near_async::actix::ActixResult;
 use near_async::futures::{DelayedActionRunnerExt as _, FutureSpawner, FutureSpawnerExt};
 use near_async::messaging::{
-    Actor, AsyncSender, CanSend, Handler, IntoMultiSender as _, IntoSender as _, SendAsync, Sender,
+    Actor, AsyncSender, CanSend, Handler, IntoMultiSender as _, IntoSender as _, Message,
+    SendAsync, Sender,
 };
 use near_async::test_loop::sender::TestLoopSender;
 use near_async::time::{Clock, Duration};
 use near_async::{MultiSend, MultiSenderFrom};
-use near_chain::BlockHeader;
-use near_chain::chain::ChunkStateWitnessMessage;
-use near_client::chunk_executor_actor::ExecutorIncomingReceipts;
+use near_chain::{Block, BlockHeader};
+use near_client::spice_data_distributor_actor::SpiceDistributorOutgoingReceipts;
 use near_client::{BlockApproval, BlockResponse, SetNetworkInfo};
 use near_network::client::{
     BlockHeadersRequest, BlockHeadersResponse, BlockRequest, ChunkEndorsementMessage,
@@ -20,6 +19,7 @@ use near_network::client::{
     ProcessTxResponse,
 };
 use near_network::shards_manager::ShardsManagerRequestFromNetwork;
+use near_network::spice_data_distribution::SpiceIncomingPartialData;
 use near_network::state_witness::{
     ChunkContractAccessesMessage, ChunkStateWitnessAckMessage, ContractCodeRequestMessage,
     ContractCodeResponseMessage, PartialEncodedContractDeploysMessage,
@@ -28,8 +28,8 @@ use near_network::state_witness::{
 };
 use near_network::types::{
     HighestHeightPeerInfo, NetworkInfo, NetworkRequests, NetworkResponses, PeerInfo,
-    PeerManagerMessageRequest, PeerManagerMessageResponse, SetChainInfo, StateSyncEvent,
-    Tier3Request,
+    PeerManagerMessageRequest, PeerManagerMessageResponse, ReasonForBan, SetChainInfo,
+    StateSyncEvent, Tier3Request,
 };
 use near_o11y::span_wrapped_msg::{SpanWrapped, SpanWrappedMessageExt};
 use near_primitives::genesis::GenesisId;
@@ -43,8 +43,7 @@ use parking_lot::{Mutex, MutexGuard};
 #[derive(Clone, MultiSend, MultiSenderFrom)]
 pub struct ClientSenderForTestLoopNetwork {
     pub block: AsyncSender<SpanWrapped<BlockResponse>, ()>,
-    pub block_headers:
-        AsyncSender<SpanWrapped<BlockHeadersResponse>, ActixResult<BlockHeadersResponse>>,
+    pub block_headers: AsyncSender<SpanWrapped<BlockHeadersResponse>, Result<(), ReasonForBan>>,
     pub block_approval: AsyncSender<SpanWrapped<BlockApproval>, ()>,
     pub epoch_sync_request: Sender<EpochSyncRequestMessage>,
     pub epoch_sync_response: Sender<EpochSyncResponseMessage>,
@@ -60,8 +59,14 @@ pub struct TxRequestHandleSenderForTestLoopNetwork {
 
 #[derive(Clone, MultiSend, MultiSenderFrom)]
 pub struct ViewClientSenderForTestLoopNetwork {
-    pub block_headers_request: AsyncSender<BlockHeadersRequest, ActixResult<BlockHeadersRequest>>,
-    pub block_request: AsyncSender<BlockRequest, ActixResult<BlockRequest>>,
+    pub block_headers_request: AsyncSender<BlockHeadersRequest, Option<Vec<Arc<BlockHeader>>>>,
+    pub block_request: AsyncSender<BlockRequest, Option<Arc<Block>>>,
+}
+
+#[derive(Clone, MultiSend, MultiSenderFrom)]
+pub struct SpiceDataDistributorSenderForTestLoopNetwork {
+    pub receipts: Sender<SpiceDistributorOutgoingReceipts>,
+    pub incoming_data: Sender<SpiceIncomingPartialData>,
 }
 
 /// This message is used to allow TestLoopPeerManagerActor to construct NetworkInfo for each
@@ -151,6 +156,7 @@ impl TestLoopPeerManagerActor {
             network_message_to_partial_witness_handler(&account_id, shared_state.clone()),
             network_message_to_shards_manager_handler(clock, &account_id, shared_state.clone()),
             network_message_to_state_snapshot_handler(),
+            network_message_to_spice_data_distributor_handler(&account_id, shared_state.clone()),
         ];
         Self { handlers, client_sender, genesis_id, last_block_headers: HashMap::new() }
     }
@@ -217,9 +223,8 @@ struct OneClientSenders {
     rpc_handler_sender: TxRequestHandleSenderForTestLoopNetwork,
     partial_witness_sender: PartialWitnessSenderForNetwork,
     shards_manager_sender: Sender<ShardsManagerRequestFromNetwork>,
-    chunk_executor_sender: Sender<ExecutorIncomingReceipts>,
-    spice_chunk_validator_actor: Sender<SpanWrapped<ChunkStateWitnessMessage>>,
     peer_manager_sender: Sender<TestLoopNetworkBlockInfo>,
+    spice_data_distributor_actor: SpiceDataDistributorSenderForTestLoopNetwork,
 }
 
 /// This actor can be used in situations when we don't expect any events to reach it.
@@ -227,11 +232,12 @@ struct OneClientSenders {
 /// between.
 pub struct UnreachableActor {}
 
-impl<M: actix::Message> Handler<M> for UnreachableActor
+impl<M, R> Handler<M, R> for UnreachableActor
 where
-    M::Result: std::marker::Send,
+    M: Message,
+    R: Send,
 {
-    fn handle(&mut self, _msg: M) -> M::Result {
+    fn handle(&mut self, _msg: M) -> R {
         unreachable!("All events for this actor shouldn't be processed");
     }
 }
@@ -246,8 +252,7 @@ fn to_drop_events_senders(s: TestLoopSender<UnreachableActor>) -> Arc<OneClientS
         partial_witness_sender: s.clone().into_multi_sender(),
         shards_manager_sender: s.clone().into_sender(),
         peer_manager_sender: s.clone().into_sender(),
-        chunk_executor_sender: s.clone().into_sender(),
-        spice_chunk_validator_actor: s.into_sender(),
+        spice_data_distributor_actor: s.into_multi_sender(),
     })
 }
 
@@ -273,8 +278,7 @@ impl TestLoopNetworkSharedState {
         PartialWitnessSenderForNetwork: From<&'a D>,
         Sender<ShardsManagerRequestFromNetwork>: From<&'a D>,
         Sender<TestLoopNetworkBlockInfo>: From<&'a D>,
-        Sender<ExecutorIncomingReceipts>: From<&'a D>,
-        Sender<SpanWrapped<ChunkStateWitnessMessage>>: From<&'a D>,
+        SpiceDataDistributorSenderForTestLoopNetwork: From<&'a D>,
     {
         let account_id = AccountId::from(data);
         let peer_id = PeerId::from(data);
@@ -290,8 +294,7 @@ impl TestLoopNetworkSharedState {
                 partial_witness_sender: PartialWitnessSenderForNetwork::from(data),
                 shards_manager_sender: Sender::<ShardsManagerRequestFromNetwork>::from(data),
                 peer_manager_sender: Sender::<TestLoopNetworkBlockInfo>::from(data),
-                chunk_executor_sender: Sender::<ExecutorIncomingReceipts>::from(data),
-                spice_chunk_validator_actor: Sender::<SpanWrapped<ChunkStateWitnessMessage>>::from(
+                spice_data_distributor_actor: SpiceDataDistributorSenderForTestLoopNetwork::from(
                     data,
                 ),
             }),
@@ -385,6 +388,12 @@ impl Handler<Tier3Request> for TestLoopPeerManagerActor {
 }
 
 impl Handler<PeerManagerMessageRequest> for TestLoopPeerManagerActor {
+    fn handle(&mut self, msg: PeerManagerMessageRequest) {
+        Handler::<PeerManagerMessageRequest, PeerManagerMessageResponse>::handle(self, msg);
+    }
+}
+
+impl Handler<PeerManagerMessageRequest, PeerManagerMessageResponse> for TestLoopPeerManagerActor {
     fn handle(&mut self, msg: PeerManagerMessageRequest) -> PeerManagerMessageResponse {
         let PeerManagerMessageRequest::NetworkRequests(request) = msg else {
             panic!("Unexpected message: {:?}", msg);
@@ -684,41 +693,26 @@ fn network_message_to_shards_manager_handler(
                 .send(ShardsManagerRequestFromNetwork::ProcessPartialEncodedChunkForward(forward));
             None
         }
-        NetworkRequests::TestonlySpiceIncomingReceipts { block_hash, receipt_proofs } => {
-            for account_id in shared_state.accounts() {
-                // TODO(spice): Exact mock here would depend on data availability layer
-                // implementation.
-                // For now it's unusual compared to other forwarding here since we send message to
-                // my_account_id here as well to make mvp implementation simpler.
+        _ => Some(request),
+    })
+}
+
+fn network_message_to_spice_data_distributor_handler(
+    my_account_id: &AccountId,
+    shared_state: TestLoopNetworkSharedState,
+) -> NetworkRequestHandler {
+    let my_account_id = my_account_id.clone();
+    Box::new(move |request| match request {
+        NetworkRequests::SpicePartialData { partial_data, recipients } => {
+            for account_id in recipients {
+                assert!(account_id != my_account_id, "Sending message to self not supported.");
                 shared_state
                     .senders_for_account(&my_account_id, &account_id)
-                    .chunk_executor_sender
-                    .send(ExecutorIncomingReceipts {
-                        block_hash,
-                        receipt_proofs: receipt_proofs.clone(),
+                    .spice_data_distributor_actor
+                    .send(SpiceIncomingPartialData {
+                        data: partial_data.clone(),
+                        sender: my_account_id.clone(),
                     });
-            }
-            None
-        }
-        NetworkRequests::TestonlySpiceStateWitness { state_witness } => {
-            let raw_witness_size = borsh::object_length(&state_witness).unwrap();
-            for account_id in shared_state.accounts() {
-                // TODO(spice): Exact mock here would depend on data availability layer
-                // implementation.
-                if account_id == my_account_id {
-                    continue;
-                }
-                shared_state
-                    .senders_for_account(&my_account_id, &account_id)
-                    .spice_chunk_validator_actor
-                    .send(
-                        ChunkStateWitnessMessage {
-                            witness: state_witness.clone(),
-                            raw_witness_size,
-                            processing_done_tracker: None,
-                        }
-                        .span_wrap(),
-                    );
             }
             None
         }

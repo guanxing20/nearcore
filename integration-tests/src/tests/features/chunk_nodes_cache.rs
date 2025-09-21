@@ -40,13 +40,13 @@ fn process_transaction(
             Action::FunctionCall(Box::new(FunctionCallAction {
                 args: encode(&[0u64, 10u64]),
                 method_name: "write_key_value".to_string(),
-                gas,
+                gas: Gas::from_gas(gas),
                 deposit: 0,
             })),
             Action::FunctionCall(Box::new(FunctionCallAction {
                 args: encode(&[1u64, 20u64]),
                 method_name: "write_key_value".to_string(),
-                gas,
+                gas: Gas::from_gas(gas),
                 deposit: 0,
             })),
         ],
@@ -108,8 +108,12 @@ fn compare_node_counts() {
     let signer = InMemorySigner::test_signer(&"test0".parse().unwrap());
     let tx_node_counts: Vec<TrieNodesCount> = (0..4)
         .map(|i| {
-            let touching_trie_node_cost: Gas = 16_101_955_926;
-            let read_cached_trie_node_cost: Gas = 2_280_000_000;
+            let runtime_config =
+                env.clients[0].runtime_adapter.get_runtime_config(PROTOCOL_VERSION);
+            let touching_trie_node_cost: Gas =
+                runtime_config.wasm_config.ext_costs.gas_cost(ExtCosts::touching_trie_node);
+            let read_cached_trie_node_cost: Gas =
+                runtime_config.wasm_config.ext_costs.gas_cost(ExtCosts::read_cached_trie_node);
             let num_blocks = if i < 1 { num_blocks } else { 2 * epoch_length };
             let tx_hash = process_transaction(&mut env, &signer, num_blocks, PROTOCOL_VERSION);
 
@@ -127,13 +131,13 @@ fn compare_node_counts() {
                 ExecutionMetadata::V3(profile_data) => TrieNodesCount {
                     db_reads: {
                         let cost = profile_data.get_ext_cost(ExtCosts::touching_trie_node);
-                        assert_eq!(cost % touching_trie_node_cost, 0);
-                        cost / touching_trie_node_cost
+                        assert_eq!(cost.as_gas() % touching_trie_node_cost.as_gas(), 0);
+                        cost.checked_div(touching_trie_node_cost.as_gas()).unwrap().as_gas()
                     },
                     mem_reads: {
                         let cost = profile_data.get_ext_cost(ExtCosts::read_cached_trie_node);
-                        assert_eq!(cost % read_cached_trie_node_cost, 0);
-                        cost / read_cached_trie_node_cost
+                        assert_eq!(cost.as_gas() % read_cached_trie_node_cost.as_gas(), 0);
+                        cost.checked_div(read_cached_trie_node_cost.as_gas()).unwrap().as_gas()
                     },
                 },
             }

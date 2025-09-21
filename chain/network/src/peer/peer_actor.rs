@@ -2,7 +2,7 @@ use crate::accounts_data::AccountDataError;
 use crate::client::{
     AnnounceAccountRequest, BlockHeadersRequest, BlockHeadersResponse, BlockRequest, BlockResponse,
     EpochSyncRequestMessage, EpochSyncResponseMessage, OptimisticBlockMessage, ProcessTxRequest,
-    StateRequestHeader, StateRequestPart, StateResponseReceived,
+    StateRequestHeader, StateRequestPart, StateResponse, StateResponseReceived,
 };
 use crate::concurrency::atomic_cell::AtomicCell;
 use crate::concurrency::demux;
@@ -39,8 +39,8 @@ use lru::LruCache;
 use near_async::messaging::{CanSend, SendAsync};
 use near_async::time;
 use near_crypto::Signature;
+use near_o11y::log_assert;
 use near_o11y::span_wrapped_msg::{SpanWrapped, SpanWrappedMessageExt};
-use near_o11y::{WithSpanContext, handler_debug_span, log_assert};
 use near_performance_metrics_macros::perf;
 use near_primitives::hash::CryptoHash;
 use near_primitives::network::{AnnounceAccount, PeerId};
@@ -1098,12 +1098,14 @@ impl PeerActor {
                     .flatten()
                     .map(|response| PeerMessage::VersionedStateResponse(*response.0)),
                 PeerMessage::VersionedStateResponse(info) => {
-                    //TODO: Route to state sync actor.
                     network_state
                         .client
                         .send_async(
-                            StateResponseReceived { peer_id, state_response_info: info.into() }
-                                .span_wrap(),
+                            StateResponseReceived {
+                                peer_id,
+                                state_response: StateResponse::State(info.into()),
+                            }
+                            .span_wrap(),
                         )
                         .await
                         .ok();
@@ -1397,16 +1399,19 @@ impl PeerActor {
                 }
 
                 // Drop duplicated messages routed within DROP_DUPLICATED_MESSAGES_PERIOD ms
-                let key = (msg.author().clone(), msg.target().clone(), msg.signature().clone());
-                let now = self.clock.now();
-                if let Some(&t) = self.routed_message_cache.get(&key) {
-                    if now <= t + DROP_DUPLICATED_MESSAGES_PERIOD {
-                        metrics::MessageDropped::Duplicate.inc(msg.body());
-                        #[cfg(test)]
-                        self.network_state.config.event_sink.send(Event::RoutedMessageDropped);
-                        tracing::debug!(target: "network", "Dropping duplicated message from {} to {:?}", msg.author(), msg.target());
-                        return;
+                if let Some(signature) = msg.signature() {
+                    let key = (msg.author().clone(), msg.target().clone(), signature.clone());
+                    let now = self.clock.now();
+                    if let Some(&t) = self.routed_message_cache.get(&key) {
+                        if now <= t + DROP_DUPLICATED_MESSAGES_PERIOD {
+                            metrics::MessageDropped::Duplicate.inc(msg.body());
+                            #[cfg(test)]
+                            self.network_state.config.event_sink.send(Event::RoutedMessageDropped);
+                            tracing::debug!(target: "network", "Dropping duplicated message from {} to {:?}", msg.author(), msg.target());
+                            return;
+                        }
                     }
+                    self.routed_message_cache.put(key, now);
                 }
                 if let TieredMessageBody::T2(t2) = msg.body() {
                     if let T2MessageBody::ForwardTx(_) = t2.as_ref() {
@@ -1423,7 +1428,6 @@ impl PeerActor {
                         self.network_state.txns_since_last_block.fetch_add(1, Ordering::AcqRel);
                     }
                 }
-                self.routed_message_cache.put(key, now);
 
                 if !msg.verify() {
                     // Received invalid routed message from peer.
@@ -1770,12 +1774,11 @@ impl actix::Handler<stream::Frame> for PeerActor {
     }
 }
 
-impl actix::Handler<WithSpanContext<SpanWrapped<SendMessage>>> for PeerActor {
+impl actix::Handler<SpanWrapped<SendMessage>> for PeerActor {
     type Result = ();
 
     #[perf]
-    fn handle(&mut self, msg: WithSpanContext<SpanWrapped<SendMessage>>, _: &mut Self::Context) {
-        let (_span, msg) = handler_debug_span!(target: "network", msg);
+    fn handle(&mut self, msg: SpanWrapped<SendMessage>, _: &mut Self::Context) {
         let msg = msg.span_unwrap();
         self.send_message(&msg.message);
     }
@@ -1788,16 +1791,11 @@ pub(crate) struct Stop {
     pub ban_reason: Option<ReasonForBan>,
 }
 
-impl actix::Handler<WithSpanContext<SpanWrapped<Stop>>> for PeerActor {
+impl actix::Handler<SpanWrapped<Stop>> for PeerActor {
     type Result = ();
 
     #[perf]
-    fn handle(
-        &mut self,
-        msg: WithSpanContext<SpanWrapped<Stop>>,
-        ctx: &mut Self::Context,
-    ) -> Self::Result {
-        let (_span, msg) = handler_debug_span!(target: "network", msg);
+    fn handle(&mut self, msg: SpanWrapped<Stop>, ctx: &mut Self::Context) -> Self::Result {
         let msg = msg.span_unwrap();
         self.stop(
             ctx,

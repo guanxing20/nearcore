@@ -6,11 +6,12 @@ pub use crate::trie::config::TrieConfig;
 pub(crate) use crate::trie::config::{
     DEFAULT_SHARD_CACHE_DELETIONS_QUEUE_CAPACITY, DEFAULT_SHARD_CACHE_TOTAL_SIZE_LIMIT,
 };
+pub use crate::trie::mem::split::{TrieSplit, find_trie_split};
 pub use crate::trie::nibble_slice::NibbleSlice;
 pub use crate::trie::prefetching_trie_storage::{PrefetchApi, PrefetchError};
 pub use crate::trie::shard_tries::{KeyForStateChanges, ShardTries, WrappedTrieChanges};
 pub use crate::trie::state_snapshot::{
-    STATE_SNAPSHOT_COLUMNS, SnapshotError, StateSnapshot, StateSnapshotConfig, state_snapshots_dir,
+    STATE_SNAPSHOT_COLUMNS, SnapshotError, StateSnapshot, StateSnapshotConfig,
 };
 pub use crate::trie::trie_storage::{TrieCache, TrieCachingStorage, TrieDBStorage, TrieStorage};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -24,8 +25,8 @@ pub use near_primitives::shard_layout::ShardUId;
 use near_primitives::state::PartialState;
 use near_primitives::state::{FlatStateValue, ValueRef};
 use near_primitives::state_record::StateRecord;
-use near_primitives::trie_key::TrieKey;
 use near_primitives::trie_key::trie_key_parsers::parse_account_id_prefix;
+use near_primitives::trie_key::{SmallKeyVec, TrieKey};
 use near_primitives::types::{AccountId, StateRoot, StateRootNode};
 use near_schema_checker_lib::ProtocolSchema;
 use near_vm_runner::ContractCode;
@@ -65,6 +66,10 @@ pub mod trie_storage_update;
 #[cfg(test)]
 mod trie_tests;
 pub mod update;
+
+/// Number of children for a trie branch
+pub const NUM_CHILDREN: usize = 16;
+pub type ChildrenMask = u16;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartialStorage {
@@ -1328,22 +1333,31 @@ impl Trie {
         {
             let mut accessed_nodes = Vec::new();
             let mem_value = lock.lookup(&self.root, key, Some(&mut accessed_nodes))?;
-            if use_trie_accounting_cache {
-                for (node_hash, serialized_node) in &accessed_nodes {
-                    if access_options.trie_access_tracker.track_mem_lookup(node_hash).is_none() {
+            for node_view in accessed_nodes {
+                let node_hash = node_view.node_hash();
+                let mut serialized_node: Option<Arc<[u8]>> = None;
+                let mut get_serialized_node = || -> Arc<[u8]> {
+                    serialized_node
+                        .get_or_insert_with(|| {
+                            borsh::to_vec(&node_view.to_raw_trie_node_with_size()).unwrap().into()
+                        })
+                        .clone()
+                };
+
+                if use_trie_accounting_cache {
+                    if access_options.trie_access_tracker.track_mem_lookup(&node_hash).is_none() {
                         access_options
                             .trie_access_tracker
-                            .track_disk_lookup(*node_hash, Arc::clone(serialized_node));
+                            .track_disk_lookup(node_hash, get_serialized_node());
+                    }
+                }
+                if access_options.enable_state_witness_recording {
+                    if let Some(recorder) = &self.recorder {
+                        recorder.record_with(&node_hash, get_serialized_node);
                     }
                 }
             }
-            if access_options.enable_state_witness_recording {
-                if let Some(recorder) = &self.recorder {
-                    for (node_hash, serialized_node) in accessed_nodes {
-                        recorder.record(&node_hash, serialized_node);
-                    }
-                }
-            }
+
             mem_value
         } else {
             lock.lookup(&self.root, key, None)?
@@ -1557,9 +1571,12 @@ impl Trie {
         } else {
             &empty_set
         };
+        let mut key_buf = SmallKeyVec::new_const();
         for account_id in codes_to_record.iter() {
             let trie_key = TrieKey::ContractCode { account_id: account_id.clone() };
-            let _ = self.get(&trie_key.to_vec(), opts);
+            key_buf.clear();
+            trie_key.append_into(&mut key_buf);
+            let _ = self.get(&key_buf, opts);
         }
 
         if self.memtries.is_some() {
@@ -1673,8 +1690,7 @@ impl Trie {
         self.disk_iter_with_prune_condition(None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn disk_iter_with_max_depth(
+    pub fn disk_iter_with_max_depth(
         &self,
         max_depth: usize,
     ) -> Result<DiskTrieIterator, StorageError> {
@@ -1694,7 +1710,11 @@ impl Trie {
     /// constructed afterward. This is needed because memtries are not
     /// thread-safe.
     pub fn lock_for_iter(&self) -> TrieWithReadLock<'_> {
-        TrieWithReadLock { trie: self, memtries: self.memtries.as_ref().map(|m| m.read()) }
+        TrieWithReadLock { trie: self, memtries: self.lock_memtries() }
+    }
+
+    pub fn lock_memtries(&self) -> Option<RwLockReadGuard<'_, MemTries>> {
+        self.memtries.as_ref().map(|m| m.read())
     }
 
     /// Splits the trie, separating entries by the boundary account.
@@ -1783,11 +1803,15 @@ impl<'a> TrieWithReadLock<'a> {
 
 impl TrieAccess for Trie {
     fn get(&self, key: &TrieKey, opts: AccessOptions) -> Result<Option<Vec<u8>>, StorageError> {
-        Trie::get(self, &key.to_vec(), opts)
+        let mut key_buf = SmallKeyVec::new_const();
+        key.append_into(&mut key_buf);
+        Trie::get(self, &key_buf, opts)
     }
 
     fn contains_key(&self, key: &TrieKey, opts: AccessOptions) -> Result<bool, StorageError> {
-        Trie::contains_key(&self, &key.to_vec(), opts)
+        let mut key_buf = SmallKeyVec::new_const();
+        key.append_into(&mut key_buf);
+        Trie::contains_key(&self, &key_buf, opts)
     }
 }
 

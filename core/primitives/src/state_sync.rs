@@ -3,9 +3,11 @@ use crate::merkle::MerklePath;
 use crate::sharding::{
     ReceiptProof, ShardChunk, ShardChunkHeader, ShardChunkHeaderV1, ShardChunkV1,
 };
+use crate::state_part::{StatePart, StatePartV0};
 use crate::types::{BlockHeight, EpochId, ShardId, StateRoot, StateRootNode};
 use borsh::{BorshDeserialize, BorshSerialize};
-use near_primitives_core::types::EpochHeight;
+use near_primitives_core::types::{EpochHeight, ProtocolVersion};
+use near_primitives_core::version::ProtocolFeature;
 use near_schema_checker_lib::ProtocolSchema;
 use std::sync::Arc;
 
@@ -20,6 +22,52 @@ pub struct StateHeaderKey(pub ShardId, pub CryptoHash);
 
 #[derive(PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, ProtocolSchema)]
 pub struct StatePartKey(pub CryptoHash, pub ShardId, pub u64 /* PartId */);
+
+#[derive(
+    Copy, PartialEq, Eq, Clone, Debug, Hash, BorshSerialize, BorshDeserialize, ProtocolSchema,
+)]
+pub enum PartIdOrHeader {
+    Part { part_id: u64 },
+    Header,
+}
+
+impl Into<&'static str> for PartIdOrHeader {
+    fn into(self) -> &'static str {
+        match self {
+            PartIdOrHeader::Part { .. } => "part",
+            PartIdOrHeader::Header => "header",
+        }
+    }
+}
+
+#[derive(Copy, PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, ProtocolSchema)]
+pub enum StateRequestAckBody {
+    WillRespond,
+    Busy,
+    Error,
+}
+
+impl Into<&'static str> for StateRequestAckBody {
+    fn into(self) -> &'static str {
+        match self {
+            StateRequestAckBody::WillRespond => "will_respond",
+            StateRequestAckBody::Busy => "busy",
+            StateRequestAckBody::Error => "error",
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, ProtocolSchema)]
+pub struct StateRequestAck {
+    /// Requested shard id
+    pub shard_id: ShardId,
+    /// Sync block hash
+    pub sync_hash: CryptoHash,
+    /// Requested header or part id
+    pub part_id_or_header: PartIdOrHeader,
+    /// Ack contents
+    pub body: StateRequestAckBody,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, ProtocolSchema)]
 pub struct ShardStateSyncResponseHeaderV1 {
@@ -201,6 +249,16 @@ pub struct ShardStateSyncResponseV1 {
     pub part: Option<(u64, Vec<u8>)>,
 }
 
+impl ShardStateSyncResponseV1 {
+    pub fn part_id(&self) -> Option<u64> {
+        self.part.as_ref().map(|(part_id, _)| *part_id)
+    }
+
+    pub fn payload_length(&self) -> Option<usize> {
+        self.part.as_ref().map(|(_, part)| part.len())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, ProtocolSchema)]
 pub struct ShardStateSyncResponseV2 {
     pub header: Option<ShardStateSyncResponseHeaderV2>,
@@ -211,9 +269,15 @@ pub struct ShardStateSyncResponseV2 {
 pub struct ShardStateSyncResponseV3 {
     pub header: Option<ShardStateSyncResponseHeaderV2>,
     pub part: Option<(u64, Vec<u8>)>,
-    // TODO(saketh): deprecate unused fields cached_parts and can_generate
     pub cached_parts: Option<CachedParts>,
     pub can_generate: bool,
+}
+
+/// Between V3 to V4 we removed unused fields `cached_parts` and `can_generate` and introduced versioned `StatePart`.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, ProtocolSchema)]
+pub struct ShardStateSyncResponseV4 {
+    pub header: Option<ShardStateSyncResponseHeaderV2>,
+    pub part: Option<(u64, StatePart)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, ProtocolSchema)]
@@ -223,33 +287,40 @@ pub enum ShardStateSyncResponse {
     V1(ShardStateSyncResponseV1) = 0,
     V2(ShardStateSyncResponseV2) = 1,
     V3(ShardStateSyncResponseV3) = 2,
+    V4(ShardStateSyncResponseV4) = 3,
 }
 
 impl ShardStateSyncResponse {
-    pub fn new_from_header(header: Option<ShardStateSyncResponseHeaderV2>) -> Self {
-        Self::V3(ShardStateSyncResponseV3 {
-            header,
-            part: None,
-            cached_parts: None,
-            can_generate: false,
-        })
+    pub fn new_from_header(
+        header: Option<ShardStateSyncResponseHeaderV2>,
+        protocol_version: ProtocolVersion,
+    ) -> Self {
+        Self::new_from_header_or_part(header, None, protocol_version)
     }
 
-    pub fn new_from_part(part: Option<(u64, Vec<u8>)>) -> Self {
-        Self::V3(ShardStateSyncResponseV3 {
-            header: None,
-            part,
-            cached_parts: None,
-            can_generate: false,
-        })
+    pub fn new_from_part(
+        part: Option<(u64, StatePart)>,
+        protocol_version: ProtocolVersion,
+    ) -> Self {
+        Self::new_from_header_or_part(None, part, protocol_version)
     }
 
-    pub fn part_id(&self) -> Option<u64> {
-        match self {
-            Self::V1(response) => response.part_id(),
-            Self::V2(response) => response.part.as_ref().map(|(part_id, _)| *part_id),
-            Self::V3(response) => response.part.as_ref().map(|(part_id, _)| *part_id),
+    fn new_from_header_or_part(
+        header: Option<ShardStateSyncResponseHeaderV2>,
+        part: Option<(u64, StatePart)>,
+        protocol_version: ProtocolVersion,
+    ) -> Self {
+        if ProtocolFeature::StatePartsCompression.enabled(protocol_version) {
+            return Self::V4(ShardStateSyncResponseV4 { header, part });
         }
+        let part = match part {
+            None => None,
+            Some((part_id, StatePart::V0(part))) => Some((part_id, part.0)),
+            // This should not happen, as it would mean we serve `StatePartV1`` or higher
+            // before `StatePartsCompression` is enabled.
+            _ => panic!("StatePartsCompression not supported and part={part:?}"),
+        };
+        Self::V3(ShardStateSyncResponseV3 { header, part, cached_parts: None, can_generate: false })
     }
 
     pub fn take_header(self) -> Option<ShardStateSyncResponseHeader> {
@@ -257,53 +328,41 @@ impl ShardStateSyncResponse {
             Self::V1(response) => response.header.map(ShardStateSyncResponseHeader::V1),
             Self::V2(response) => response.header.map(ShardStateSyncResponseHeader::V2),
             Self::V3(response) => response.header.map(ShardStateSyncResponseHeader::V2),
+            Self::V4(response) => response.header.map(ShardStateSyncResponseHeader::V2),
         }
     }
 
-    pub fn part(&self) -> &Option<(u64, Vec<u8>)> {
-        match self {
-            Self::V1(response) => &response.part,
-            Self::V2(response) => &response.part,
-            Self::V3(response) => &response.part,
-        }
-    }
-
-    pub fn take_part(self) -> Option<(u64, Vec<u8>)> {
-        match self {
-            Self::V1(response) => response.part,
-            Self::V2(response) => response.part,
-            Self::V3(response) => response.part,
-        }
-    }
-
-    pub fn can_generate(&self) -> bool {
-        match self {
-            Self::V1(_response) => false,
-            Self::V2(_response) => false,
-            Self::V3(response) => response.can_generate,
-        }
-    }
-
-    pub fn cached_parts(&self) -> &Option<CachedParts> {
-        match self {
-            Self::V1(_response) => &None,
-            Self::V2(_response) => &None,
-            Self::V3(response) => &response.cached_parts,
-        }
-    }
-
-    pub fn has_header(&self) -> bool {
-        match self {
-            Self::V1(response) => response.header.is_some(),
-            Self::V2(response) => response.header.is_some(),
-            Self::V3(response) => response.header.is_some(),
-        }
-    }
-}
-
-impl ShardStateSyncResponseV1 {
     pub fn part_id(&self) -> Option<u64> {
-        self.part.as_ref().map(|(part_id, _)| *part_id)
+        match self {
+            Self::V1(response) => response.part.as_ref().map(|(part_id, _)| *part_id),
+            Self::V2(response) => response.part.as_ref().map(|(part_id, _)| *part_id),
+            Self::V3(response) => response.part.as_ref().map(|(part_id, _)| *part_id),
+            Self::V4(response) => response.part.as_ref().map(|(part_id, _)| *part_id),
+        }
+    }
+
+    pub fn take_part(self) -> Option<(u64, StatePart)> {
+        match self {
+            Self::V1(response) => {
+                response.part.map(|(idx, part)| (idx, StatePart::V0(StatePartV0(part))))
+            }
+            Self::V2(response) => {
+                response.part.map(|(idx, part)| (idx, StatePart::V0(StatePartV0(part))))
+            }
+            Self::V3(response) => {
+                response.part.map(|(idx, part)| (idx, StatePart::V0(StatePartV0(part))))
+            }
+            Self::V4(response) => response.part,
+        }
+    }
+
+    pub fn payload_length(&self) -> Option<usize> {
+        match self {
+            Self::V1(response) => response.part.as_ref().map(|(_, part)| part.len()),
+            Self::V2(response) => response.part.as_ref().map(|(_, part)| part.len()),
+            Self::V3(response) => response.part.as_ref().map(|(_, part)| part.len()),
+            Self::V4(response) => response.part.as_ref().map(|(_, part)| part.payload_length()),
+        }
     }
 }
 

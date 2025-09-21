@@ -4,7 +4,7 @@ use itertools::Itertools;
 use lru::LruCache;
 use near_async::messaging::Sender;
 use near_async::time::{Clock, Instant};
-use near_chain_configs::{ClientConfig, LogSummaryStyle, SyncConfig};
+use near_chain_configs::{ClientConfig, LogSummaryStyle};
 use near_client_primitives::types::StateSyncStatus;
 use near_epoch_manager::EpochManagerAdapter;
 use near_network::types::NetworkInfo;
@@ -58,7 +58,7 @@ pub struct InfoHelper {
     /// Total number of blocks processed.
     num_chunks_in_blocks_processed: u64,
     /// Total gas used during period.
-    gas_used: u64,
+    gas_used: Gas,
     /// Telemetry event sender.
     telemetry_sender: Sender<TelemetryEvent>,
     /// Log coloring enabled.
@@ -91,7 +91,7 @@ impl InfoHelper {
             started: clock.now(),
             num_blocks_processed: 0,
             num_chunks_in_blocks_processed: 0,
-            gas_used: 0,
+            gas_used: Gas::ZERO,
             telemetry_sender,
             log_summary_style: client_config.log_summary_style,
             boot_time_seconds: clock.now_utc().unix_timestamp(),
@@ -105,7 +105,7 @@ impl InfoHelper {
     pub fn chunk_processed(&self, shard_id: ShardId, gas_used: Gas, balance_burnt: Balance) {
         metrics::TGAS_USAGE_HIST
             .with_label_values(&[&shard_id.to_string()])
-            .observe(gas_used as f64 / TERAGAS);
+            .observe(gas_used.as_gas() as f64 / TERAGAS);
         metrics::BALANCE_BURNT.inc_by(balance_burnt as f64);
     }
 
@@ -126,8 +126,8 @@ impl InfoHelper {
     ) {
         self.num_blocks_processed += 1;
         self.num_chunks_in_blocks_processed += num_chunks;
-        self.gas_used += gas_used;
-        metrics::GAS_USED.inc_by(gas_used as f64);
+        self.gas_used = self.gas_used.checked_add(gas_used).unwrap();
+        metrics::GAS_USED.inc_by(gas_used.as_gas() as f64);
         metrics::BLOCKS_PROCESSED.inc();
         metrics::CHUNKS_PROCESSED.inc_by(num_chunks);
         metrics::GAS_PRICE.set(gas_price as f64);
@@ -410,8 +410,7 @@ impl InfoHelper {
 
         let s = |num| if num == 1 { "" } else { "s" };
 
-        let sync_status_log =
-            Some(display_sync_status(sync_status, head, &client_config.state_sync.sync));
+        let sync_status_log = Some(display_sync_status(sync_status, head));
         let validator_info_log = validator_info.as_ref().map(|info| {
             format!(
                 " {}{} validator{}",
@@ -433,7 +432,7 @@ impl InfoHelper {
         let avg_bls = (self.num_blocks_processed as f64)
             / (now.signed_duration_since(self.started).whole_milliseconds() as f64)
             * 1000.0;
-        let avg_gas_used = ((self.gas_used as f64)
+        let avg_gas_used = ((self.gas_used.as_gas() as f64)
             / (now.signed_duration_since(self.started).whole_milliseconds() as f64)
             * 1000.0) as u64;
         let blocks_info_log =
@@ -474,7 +473,7 @@ impl InfoHelper {
         self.started = self.clock.now();
         self.num_blocks_processed = 0;
         self.num_chunks_in_blocks_processed = 0;
-        self.gas_used = 0;
+        self.gas_used = Gas::ZERO;
 
         let telemetry_event = TelemetryEvent {
             content: self.telemetry_info(
@@ -702,11 +701,7 @@ pub fn log_catchup_status(catchup_status: Vec<CatchupStatusView>) {
     }
 }
 
-pub fn display_sync_status(
-    sync_status: &SyncStatus,
-    head: &Tip,
-    state_sync_config: &SyncConfig,
-) -> String {
+pub fn display_sync_status(sync_status: &SyncStatus, head: &Tip) -> String {
     metrics::SYNC_STATUS.set(sync_status.repr() as i64);
     match sync_status {
         SyncStatus::AwaitingPeers => format!("#{:>8} Waiting for peers", head.height),
@@ -764,15 +759,6 @@ pub fn display_sync_status(
                 computation_tasks.len()
             )
             .unwrap();
-            if let SyncConfig::Peers = state_sync_config {
-                tracing::warn!(
-                    target: "stats",
-                    "The node is trying to sync its State from its peers. The current implementation of this mechanism is known to be unreliable. It may never complete, or fail randomly and corrupt the DB.\n\
-                     Suggestions:\n\
-                      * Try to state sync from GCS. See `\"state_sync\"` and `\"state_sync_enabled\"` options in the reference `config.json` file.
-                      or
-                      * Disable state sync in the config. Add `\"state_sync_enabled\": false` to `config.json`, then download a recent data snapshot and restart the node.");
-            };
             res
         }
         SyncStatus::StateSyncDone => "State sync done".to_string(),
@@ -973,6 +959,7 @@ mod tests {
     use near_async::messaging::{IntoMultiSender, IntoSender, noop};
     use near_async::time::Clock;
     use near_chain::runtime::NightshadeRuntime;
+    use near_chain::spice_core::CoreStatementsProcessor;
     use near_chain::types::ChainConfig;
     use near_chain::{Chain, ChainGenesis, DoomslugThresholdMode};
     use near_chain_configs::{Genesis, MutableConfigValue};
@@ -980,6 +967,7 @@ mod tests {
     use near_epoch_manager::shard_tracker::ShardTracker;
     use near_epoch_manager::test_utils::*;
     use near_network::test_utils::peer_id_from_seed;
+    use near_store::adapter::StoreAdapter as _;
     use near_store::genesis::initialize_genesis_state;
 
     #[test]
@@ -1015,13 +1003,17 @@ mod tests {
         initialize_genesis_state(store.clone(), &genesis, Some(tempdir.path()));
         let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
         let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
-        let runtime =
-            NightshadeRuntime::test(tempdir.path(), store, &genesis.config, epoch_manager.clone());
+        let runtime = NightshadeRuntime::test(
+            tempdir.path(),
+            store.clone(),
+            &genesis.config,
+            epoch_manager.clone(),
+        );
         let chain_genesis = ChainGenesis::new(&genesis.config);
         let doomslug_threshold_mode = DoomslugThresholdMode::TwoThirds;
         let chain = Chain::new(
             Clock::real(),
-            epoch_manager,
+            epoch_manager.clone(),
             shard_tracker,
             runtime,
             &chain_genesis,
@@ -1031,6 +1023,7 @@ mod tests {
             Default::default(),
             validator.clone(),
             noop().into_multi_sender(),
+            CoreStatementsProcessor::new_with_noop_senders(store.chain_store(), epoch_manager),
         )
         .unwrap();
 

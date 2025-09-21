@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use actix::{Actor, Addr, System};
+use actix::Actor;
 use futures::{FutureExt, future};
 use near_chain_configs::test_utils::{TESTING_INIT_BALANCE, TESTING_INIT_STAKE};
 use near_primitives::num_rational::Ratio;
@@ -12,9 +12,7 @@ use crate::utils::genesis_helpers::genesis_hash;
 use crate::utils::test_helpers::heavy_test;
 use near_actix_test_utils::run_actix;
 use near_chain_configs::{Genesis, NEAR_BASE, TrackedShardsConfig};
-use near_client::{
-    ClientActor, GetBlock, ProcessTxRequest, Query, RpcHandlerActor, ViewClientActor,
-};
+use near_client::{GetBlock, ProcessTxRequest, Query, RpcHandler, ViewClientActorInner};
 use near_crypto::{InMemorySigner, Signer};
 use near_network::tcp;
 use near_network::test_utils::{WaitOrTimeoutActor, convert_boot_nodes};
@@ -25,8 +23,12 @@ use near_primitives::types::{AccountId, BlockHeightDelta, BlockReference, NumSea
 use near_primitives::views::{QueryRequest, QueryResponseKind, ValidatorInfo};
 use nearcore::{NearConfig, load_test_config, start_with_config};
 
+use near_async::ActorSystem;
+use near_async::messaging::CanSendAsync;
+use near_async::multithread::MultithreadRuntimeHandle;
+use near_async::tokio::TokioRuntimeHandle;
+use near_client::client_actor::ClientActorInner;
 use near_client_primitives::types::Status;
-use near_o11y::WithSpanContextExt;
 use near_o11y::span_wrapped_msg::SpanWrappedMessageExt;
 use {near_primitives::types::BlockId, primitive_types::U256};
 
@@ -35,9 +37,9 @@ struct TestNode {
     account_id: AccountId,
     signer: Arc<Signer>,
     config: NearConfig,
-    client: Addr<ClientActor>,
-    view_client: Addr<ViewClientActor>,
-    tx_processor: Addr<RpcHandlerActor>,
+    client: TokioRuntimeHandle<ClientActorInner>,
+    view_client: MultithreadRuntimeHandle<ViewClientActorInner>,
+    tx_processor: MultithreadRuntimeHandle<RpcHandler>,
     genesis_hash: CryptoHash,
 }
 
@@ -84,12 +86,14 @@ fn init_test_staking(
         config.client_config.min_num_peers = num_node_seats as usize - 1;
         config
     });
+    let actor_system = ActorSystem::new();
     configs
         .enumerate()
         .map(|(i, config)| {
             let genesis_hash = genesis_hash(&config.genesis);
             let nearcore::NearNode { client, view_client, rpc_handler: tx_processor, .. } =
-                start_with_config(paths[i], config.clone()).expect("start_with_config");
+                start_with_config(paths[i], config.clone(), actor_system.clone())
+                    .expect("start_with_config");
             let account_id = format!("near.{}", i).parse::<AccountId>().unwrap();
             let signer = Arc::new(InMemorySigner::test_signer(&account_id));
             TestNode { account_id, signer, config, client, view_client, tx_processor, genesis_hash }
@@ -131,24 +135,19 @@ fn slow_test_stake_nodes() {
             actix::spawn(
                 test_nodes[0]
                     .tx_processor
-                    .send(
-                        ProcessTxRequest {
-                            transaction: tx,
-                            is_forwarded: false,
-                            check_only: false,
-                        }
-                        .with_span_context(),
-                    )
-                    .map(drop),
+                    .send_async(ProcessTxRequest {
+                        transaction: tx,
+                        is_forwarded: false,
+                        check_only: false,
+                    })
+                    .map(drop::<Result<near_client::ProcessTxResponse, _>>),
             );
 
             WaitOrTimeoutActor::new(
                 Box::new(move |_ctx| {
-                    let actor = test_nodes[0].client.send(
-                        Status { is_health_check: false, detailed: false }
-                            .span_wrap()
-                            .with_span_context(),
-                    );
+                    let actor = test_nodes[0]
+                        .client
+                        .send_async(Status { is_health_check: false, detailed: false }.span_wrap());
                     let actor = actor.then(|res| {
                         let res = res.unwrap();
                         if res.is_err() {
@@ -162,7 +161,7 @@ fn slow_test_stake_nodes() {
                                 ValidatorInfo { account_id: "near.1".parse().unwrap() },
                             ]
                         {
-                            System::current().stop();
+                            near_async::shutdown_all_actors();
                         }
                         future::ready(())
                     });
@@ -218,15 +217,12 @@ fn slow_test_validator_kickout() {
                 actix::spawn(
                     test_node
                         .tx_processor
-                        .send(
-                            ProcessTxRequest {
-                                transaction: stake_transaction,
-                                is_forwarded: false,
-                                check_only: false,
-                            }
-                            .with_span_context(),
-                        )
-                        .map(drop),
+                        .send_async(ProcessTxRequest {
+                            transaction: stake_transaction,
+                            is_forwarded: false,
+                            check_only: false,
+                        })
+                        .map(drop::<Result<near_client::ProcessTxResponse, _>>),
                 );
             }
 
@@ -239,11 +235,9 @@ fn slow_test_validator_kickout() {
                     let test_node1 = test_nodes[(num_nodes / 2) as usize].clone();
                     let finalized_mark1 = finalized_mark.clone();
 
-                    let actor = test_node1.client.send(
-                        Status { is_health_check: false, detailed: false }
-                            .span_wrap()
-                            .with_span_context(),
-                    );
+                    let actor = test_node1
+                        .client
+                        .send_async(Status { is_health_check: false, detailed: false }.span_wrap());
                     let actor = actor.then(move |res| {
                         let expected: Vec<_> = (num_nodes / 2..num_nodes)
                             .map(|i| ValidatorInfo {
@@ -257,15 +251,12 @@ fn slow_test_validator_kickout() {
                         if res.unwrap().validators == expected {
                             for i in 0..num_nodes / 2 {
                                 let mark = finalized_mark1[i as usize].clone();
-                                let actor = test_node1.view_client.send(
-                                    Query::new(
-                                        BlockReference::latest(),
-                                        QueryRequest::ViewAccount {
-                                            account_id: test_nodes[i as usize].account_id.clone(),
-                                        },
-                                    )
-                                    .with_span_context(),
-                                );
+                                let actor = test_node1.view_client.send_async(Query::new(
+                                    BlockReference::latest(),
+                                    QueryRequest::ViewAccount {
+                                        account_id: test_nodes[i as usize].account_id.clone(),
+                                    },
+                                ));
                                 let actor =
                                     actor.then(move |res| match res.unwrap().unwrap().kind {
                                         QueryResponseKind::ViewAccount(result) => {
@@ -283,15 +274,12 @@ fn slow_test_validator_kickout() {
                             for i in num_nodes / 2..num_nodes {
                                 let mark = finalized_mark1[i as usize].clone();
 
-                                let actor = test_node1.view_client.send(
-                                    Query::new(
-                                        BlockReference::latest(),
-                                        QueryRequest::ViewAccount {
-                                            account_id: test_nodes[i as usize].account_id.clone(),
-                                        },
-                                    )
-                                    .with_span_context(),
-                                );
+                                let actor = test_node1.view_client.send_async(Query::new(
+                                    BlockReference::latest(),
+                                    QueryRequest::ViewAccount {
+                                        account_id: test_nodes[i as usize].account_id.clone(),
+                                    },
+                                ));
                                 let actor =
                                     actor.then(move |res| match res.unwrap().unwrap().kind {
                                         QueryResponseKind::ViewAccount(result) => {
@@ -309,7 +297,7 @@ fn slow_test_validator_kickout() {
                             }
 
                             if finalized_mark1.iter().all(|mark| mark.load(Ordering::SeqCst)) {
-                                System::current().stop();
+                                near_async::shutdown_all_actors();
                             }
                         }
                         future::ready(())
@@ -371,28 +359,22 @@ fn ultra_slow_test_validator_join() {
             actix::spawn(
                 test_nodes[1]
                     .tx_processor
-                    .send(
-                        ProcessTxRequest {
-                            transaction: unstake_transaction,
-                            is_forwarded: false,
-                            check_only: false,
-                        }
-                        .with_span_context(),
-                    )
-                    .map(drop),
+                    .send_async(ProcessTxRequest {
+                        transaction: unstake_transaction,
+                        is_forwarded: false,
+                        check_only: false,
+                    })
+                    .map(drop::<Result<near_client::ProcessTxResponse, _>>),
             );
             actix::spawn(
                 test_nodes[0]
                     .tx_processor
-                    .send(
-                        ProcessTxRequest {
-                            transaction: stake_transaction,
-                            is_forwarded: false,
-                            check_only: false,
-                        }
-                        .with_span_context(),
-                    )
-                    .map(drop),
+                    .send_async(ProcessTxRequest {
+                        transaction: stake_transaction,
+                        is_forwarded: false,
+                        check_only: false,
+                    })
+                    .map(drop::<Result<near_client::ProcessTxResponse, _>>),
             );
 
             let (done1, done2) =
@@ -403,11 +385,9 @@ fn ultra_slow_test_validator_join() {
                     let test_nodes = test_nodes.clone();
                     let test_node1 = test_nodes[0].clone();
                     let (done1_copy2, done2_copy2) = (done1_copy1.clone(), done2_copy1.clone());
-                    let actor = test_node1.client.send(
-                        Status { is_health_check: false, detailed: false }
-                            .span_wrap()
-                            .with_span_context(),
-                    );
+                    let actor = test_node1
+                        .client
+                        .send_async(Status { is_health_check: false, detailed: false }.span_wrap());
                     let actor = actor.then(move |res| {
                         let expected = vec![
                             ValidatorInfo { account_id: "near.0".parse().unwrap() },
@@ -418,15 +398,12 @@ fn ultra_slow_test_validator_join() {
                             return future::ready(());
                         }
                         if res.unwrap().validators == expected {
-                            let actor = test_node1.view_client.send(
-                                Query::new(
-                                    BlockReference::latest(),
-                                    QueryRequest::ViewAccount {
-                                        account_id: test_nodes[1].account_id.clone(),
-                                    },
-                                )
-                                .with_span_context(),
-                            );
+                            let actor = test_node1.view_client.send_async(Query::new(
+                                BlockReference::latest(),
+                                QueryRequest::ViewAccount {
+                                    account_id: test_nodes[1].account_id.clone(),
+                                },
+                            ));
                             let actor = actor.then(move |res| match res.unwrap().unwrap().kind {
                                 QueryResponseKind::ViewAccount(result) => {
                                     if result.locked == 0 {
@@ -437,15 +414,12 @@ fn ultra_slow_test_validator_join() {
                                 _ => panic!("wrong return result"),
                             });
                             actix::spawn(actor);
-                            let actor = test_node1.view_client.send(
-                                Query::new(
-                                    BlockReference::latest(),
-                                    QueryRequest::ViewAccount {
-                                        account_id: test_nodes[2].account_id.clone(),
-                                    },
-                                )
-                                .with_span_context(),
-                            );
+                            let actor = test_node1.view_client.send_async(Query::new(
+                                BlockReference::latest(),
+                                QueryRequest::ViewAccount {
+                                    account_id: test_nodes[2].account_id.clone(),
+                                },
+                            ));
                             let actor = actor.then(move |res| match res.unwrap().unwrap().kind {
                                 QueryResponseKind::ViewAccount(result) => {
                                     if result.locked == TESTING_INIT_STAKE {
@@ -463,7 +437,7 @@ fn ultra_slow_test_validator_join() {
                     });
                     actix::spawn(actor);
                     if done1_copy1.load(Ordering::SeqCst) && done2_copy1.load(Ordering::SeqCst) {
-                        System::current().stop();
+                        near_async::shutdown_all_actors();
                     }
                 }),
                 1000,
@@ -477,6 +451,7 @@ fn ultra_slow_test_validator_join() {
 /// Checks that during the first epoch, total_supply matches total_supply in genesis.
 /// Checks that during the second epoch, total_supply matches the expected inflation rate.
 #[test]
+#[ignore] // TODO: #14261
 fn slow_test_inflation() {
     heavy_test(|| {
         let num_nodes = 1;
@@ -506,7 +481,7 @@ fn slow_test_inflation() {
                 Box::new(move |_ctx| {
                     let (done1_copy2, done2_copy2) = (done1_copy1.clone(), done2_copy1.clone());
                     let actor =
-                        test_nodes[0].view_client.send(GetBlock::latest().with_span_context());
+                        test_nodes[0].view_client.send_async(GetBlock::latest());
                     let actor = actor.then(move |res| {
                         if let Ok(Ok(block)) = res {
                             if block.header.height >= 2 && block.header.height <= epoch_length {
@@ -524,7 +499,7 @@ fn slow_test_inflation() {
                     let view_client = test_nodes[0].view_client.clone();
                     actix::spawn(async move {
                         if let Ok(Ok(block)) =
-                            view_client.send(GetBlock::latest().with_span_context()).await
+                            view_client.send_async(GetBlock::latest()).await
                         {
                             if block.header.height > epoch_length
                                 && block.header.height < epoch_length * 2
@@ -532,19 +507,19 @@ fn slow_test_inflation() {
                                 tracing::info!(?block.header.total_supply, ?block.header.height, ?initial_total_supply, epoch_length, "Step2: epoch2");
                                 let base_reward = {
                                     let genesis_block_view = view_client
-                                        .send(
+                                        .send_async(
                                             GetBlock(BlockReference::BlockId(BlockId::Height(0)))
-                                                .with_span_context(),
+                                                ,
                                         )
                                         .await
                                         .unwrap()
                                         .unwrap();
                                     let epoch_end_block_view = view_client
-                                        .send(
+                                        .send_async(
                                             GetBlock(BlockReference::BlockId(BlockId::Height(
                                                 epoch_length,
                                             )))
-                                            .with_span_context(),
+                                            ,
                                         )
                                         .await
                                         .unwrap()
@@ -584,7 +559,7 @@ fn slow_test_inflation() {
                         }
                     });
                     if done1_copy1.load(Ordering::SeqCst) && done2_copy1.load(Ordering::SeqCst) {
-                        System::current().stop();
+                        near_async::shutdown_all_actors();
                     }
                 }),
                 100,

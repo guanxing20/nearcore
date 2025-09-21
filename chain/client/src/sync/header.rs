@@ -814,6 +814,7 @@ mod test {
                 clock.clock(),
                 None,
                 None,
+                None,
             ));
             block_merkle_tree.insert(*block.hash());
             chain2.process_block_header(block.header()).unwrap(); // just to validate

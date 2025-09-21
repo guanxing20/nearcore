@@ -1,8 +1,10 @@
 use crate::utils::genesis_helpers::genesis_block;
 use crate::utils::test_helpers::heavy_test;
-use actix::{Actor, System};
+use actix::Actor;
 use futures::{FutureExt, future};
 use near_actix_test_utils::run_actix;
+use near_async::ActorSystem;
+use near_async::messaging::CanSendAsync;
 use near_async::time::Duration;
 use near_chain_configs::Genesis;
 use near_chain_configs::test_utils::TESTING_INIT_STAKE;
@@ -10,11 +12,9 @@ use near_client::{GetBlock, ProcessTxRequest};
 use near_crypto::InMemorySigner;
 use near_network::tcp;
 use near_network::test_utils::{WaitOrTimeoutActor, convert_boot_nodes};
-use near_o11y::WithSpanContextExt;
 use near_o11y::testonly::init_integration_logger;
 use near_primitives::transaction::SignedTransaction;
 use nearcore::{load_test_config, start_with_config};
-use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,10 +44,12 @@ fn ultra_slow_test_sync_state_stake_change() {
 
         let dir1 = tempfile::Builder::new().prefix("sync_state_stake_change_1").tempdir().unwrap();
         let dir2 = tempfile::Builder::new().prefix("sync_state_stake_change_2").tempdir().unwrap();
+        let actor_system = ActorSystem::new();
         run_actix(async {
             let nearcore::NearNode {
                 view_client: view_client1, rpc_handler: tx_processor1, ..
-            } = start_with_config(dir1.path(), near1.clone()).expect("start_with_config");
+            } = start_with_config(dir1.path(), near1.clone(), actor_system.clone())
+                .expect("start_with_config");
 
             let genesis_hash = *genesis_block(&genesis).hash();
             let signer = Arc::new(InMemorySigner::test_signer(&"test1".parse().unwrap()));
@@ -61,53 +63,50 @@ fn ultra_slow_test_sync_state_stake_change() {
             );
             actix::spawn(
                 tx_processor1
-                    .send(
-                        ProcessTxRequest {
-                            transaction: unstake_transaction,
-                            is_forwarded: false,
-                            check_only: false,
-                        }
-                        .with_span_context(),
-                    )
-                    .map(drop),
+                    .send_async(ProcessTxRequest {
+                        transaction: unstake_transaction,
+                        is_forwarded: false,
+                        check_only: false,
+                    })
+                    .map(drop::<Result<near_client::ProcessTxResponse, _>>),
             );
 
             let started = Arc::new(AtomicBool::new(false));
             let dir2_path = dir2.path().to_path_buf();
-            let arbiters_holder = Arc::new(RwLock::new(vec![]));
-            let arbiters_holder2 = arbiters_holder;
+            let actor_system = actor_system.clone();
             WaitOrTimeoutActor::new(
                 Box::new(move |_ctx| {
                     let started_copy = started.clone();
                     let near2_copy = near2.clone();
                     let dir2_path_copy = dir2_path.clone();
-                    let arbiters_holder2 = arbiters_holder2.clone();
-                    let actor = view_client1.send(GetBlock::latest().with_span_context());
+                    let actor = view_client1.send_async(GetBlock::latest());
+                    let actor_system = actor_system.clone();
                     let actor = actor.then(move |res| {
                         let latest_height =
                             if let Ok(Ok(block)) = res { block.header.height } else { 0 };
                         if !started_copy.load(Ordering::SeqCst) && latest_height > 2 * epoch_length
                         {
                             started_copy.store(true, Ordering::SeqCst);
-                            let nearcore::NearNode { view_client: view_client2, arbiters, .. } =
-                                start_with_config(&dir2_path_copy, near2_copy)
-                                    .expect("start_with_config");
-                            *arbiters_holder2.write() = arbiters;
+                            let nearcore::NearNode { view_client: view_client2, .. } =
+                                start_with_config(
+                                    &dir2_path_copy,
+                                    near2_copy,
+                                    actor_system.clone(),
+                                )
+                                .expect("start_with_config");
 
                             WaitOrTimeoutActor::new(
                                 Box::new(move |_ctx| {
-                                    actix::spawn(
-                                        view_client2
-                                            .send(GetBlock::latest().with_span_context())
-                                            .then(move |res| {
-                                                if let Ok(Ok(block)) = res {
-                                                    if block.header.height > latest_height + 1 {
-                                                        System::current().stop()
-                                                    }
+                                    actix::spawn(view_client2.send_async(GetBlock::latest()).then(
+                                        move |res| {
+                                            if let Ok(Ok(block)) = res {
+                                                if block.header.height > latest_height + 1 {
+                                                    near_async::shutdown_all_actors();
                                                 }
-                                                future::ready(())
-                                            }),
-                                    );
+                                            }
+                                            future::ready(())
+                                        },
+                                    ));
                                 }),
                                 100,
                                 30000,

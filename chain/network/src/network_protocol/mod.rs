@@ -7,8 +7,10 @@ mod peer;
 mod proto_conv;
 mod state_sync;
 use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
 pub use edge::*;
 use near_primitives::genesis::GenesisId;
+pub use near_primitives::state_sync::StateRequestAck;
 use near_primitives::stateless_validation::chunk_endorsement::ChunkEndorsement;
 use near_primitives::stateless_validation::contract_distribution::ChunkContractAccesses;
 use near_primitives::stateless_validation::contract_distribution::ContractCodeRequest;
@@ -62,6 +64,8 @@ use protobuf::Message as _;
 use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Debug;
+use std::io::Read;
+use std::io::Write;
 use std::sync::Arc;
 use tracing::Span;
 
@@ -540,6 +544,10 @@ impl fmt::Debug for TieredMessageBody {
 }
 
 impl TieredMessageBody {
+    pub fn is_t1(&self) -> bool {
+        matches!(self, TieredMessageBody::T1(_))
+    }
+
     pub fn variant(&self) -> &'static str {
         match self {
             TieredMessageBody::T1(body) => (&(**body)).into(),
@@ -625,6 +633,9 @@ impl TieredMessageBody {
             }
             RoutedMessageBody::StateHeaderRequest(state_header_request) => {
                 T2MessageBody::StateHeaderRequest(state_header_request).into()
+            }
+            RoutedMessageBody::StateRequestAck(state_request_ack) => {
+                T2MessageBody::StateRequestAck(state_request_ack).into()
             }
             RoutedMessageBody::_UnusedQueryRequest
             | RoutedMessageBody::_UnusedQueryResponse
@@ -723,6 +734,7 @@ pub enum T2MessageBody {
     StatePartRequest(StatePartRequest),
     PartialEncodedContractDeploys(PartialEncodedContractDeploys),
     StateHeaderRequest(StateHeaderRequest),
+    StateRequestAck(StateRequestAck),
 }
 
 impl T2MessageBody {
@@ -782,6 +794,7 @@ pub enum RoutedMessageBody {
     ContractCodeResponse(ContractCodeResponse),
     PartialEncodedContractDeploys(PartialEncodedContractDeploys),
     StateHeaderRequest(StateHeaderRequest),
+    StateRequestAck(StateRequestAck),
 }
 
 impl RoutedMessageBody {
@@ -807,6 +820,21 @@ impl RoutedMessageBody {
             RoutedMessageBody::PartialEncodedStateWitness(_)
             | RoutedMessageBody::PartialEncodedStateWitnessForward(_)
             | RoutedMessageBody::VersionedChunkEndorsement(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_t1(&self) -> bool {
+        match self {
+            RoutedMessageBody::BlockApproval(_)
+            | RoutedMessageBody::VersionedPartialEncodedChunk(_)
+            | RoutedMessageBody::PartialEncodedChunkForward(_)
+            | RoutedMessageBody::PartialEncodedStateWitness(_)
+            | RoutedMessageBody::PartialEncodedStateWitnessForward(_)
+            | RoutedMessageBody::VersionedChunkEndorsement(_)
+            | RoutedMessageBody::ChunkContractAccesses(_)
+            | RoutedMessageBody::ContractCodeRequest(_)
+            | RoutedMessageBody::ContractCodeResponse(_) => true,
             _ => false,
         }
     }
@@ -894,6 +922,11 @@ impl fmt::Debug for RoutedMessageBody {
                 "StateHeaderRequest(sync_hash={:?}, shard_id={:?})",
                 request.sync_hash, request.shard_id,
             ),
+            RoutedMessageBody::StateRequestAck(ack) => write!(
+                f,
+                "StateRequestAck(sync_hash={:?}, shard_id={:?}, header_or_part_id={:?}, body={:?})",
+                ack.sync_hash, ack.shard_id, ack.part_id_or_header, ack.body,
+            ),
         }
     }
 }
@@ -966,11 +999,15 @@ impl From<TieredMessageBody> for RoutedMessageBody {
                 T2MessageBody::StateHeaderRequest(state_header_request) => {
                     RoutedMessageBody::StateHeaderRequest(state_header_request)
                 }
+                T2MessageBody::StateRequestAck(state_request_ack) => {
+                    RoutedMessageBody::StateRequestAck(state_request_ack)
+                }
             },
         }
     }
 }
 
+/// TODO(13709): Remove V1 support after forward compatible release.
 #[derive(
     borsh::BorshSerialize, borsh::BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema,
 )]
@@ -1001,10 +1038,28 @@ pub struct RoutedMessageV2 {
     pub num_hops: u32,
 }
 
+impl BorshSerialize for RoutedMessageV2 {
+    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        self.msg.serialize(writer)?;
+        self.created_at.map(|t| t.unix_timestamp()).serialize(writer)?;
+        self.num_hops.serialize(writer)
+    }
+}
+
+impl BorshDeserialize for RoutedMessageV2 {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let msg = RoutedMessageV1::deserialize_reader(reader)?;
+        let created_at = Option::<i64>::deserialize_reader(reader)?
+            .map(|t| time::Utc::from_unix_timestamp(t).unwrap());
+        let num_hops = u32::deserialize_reader(reader)?;
+        Ok(Self { msg, created_at, num_hops })
+    }
+}
+
 /// V3 message will remove the signature field for T1.
 /// Contains the body as a `TieredMessageBody` instead of `RoutedMessageBody`.
 /// All other fields are the same as in previous versions.
-#[derive(PartialEq, Eq, Clone, Debug, ProtocolSchema)]
+#[derive(BorshDeserialize, BorshSerialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
 pub struct RoutedMessageV3 {
     /// Peer id to which this message is directed.
     /// If `target` is hash, this message should be routed back.
@@ -1016,9 +1071,8 @@ pub struct RoutedMessageV3 {
     pub ttl: u8,
     /// Message
     pub body: TieredMessageBody,
-    /// Signature.
-    // TODO(#13709): remove for T1 messages
-    pub signature: Signature,
+    /// Signature only for T2 messages.
+    pub signature: Option<Signature>,
     /// The time the Routed message was created by `author`.
     pub created_at: Option<i64>,
     /// Number of peers this routed message traveled through.
@@ -1037,7 +1091,14 @@ impl RoutedMessageV3 {
     }
 
     pub fn verify(&self) -> bool {
-        self.signature.verify(self.hash_tiered().as_ref(), self.author.public_key())
+        if self.body.is_t1() {
+            true
+        } else {
+            let Some(signature) = &self.signature else {
+                return false;
+            };
+            signature.verify(self.hash_tiered().as_ref(), self.author.public_key())
+        }
     }
 
     pub fn expect_response(&self) -> bool {
@@ -1062,13 +1123,12 @@ impl RoutedMessageV3 {
 
 impl From<RoutedMessageV1> for RoutedMessageV3 {
     fn from(msg: RoutedMessageV1) -> Self {
-        let body = TieredMessageBody::from_routed(msg.body);
         Self {
             target: msg.target,
             author: msg.author,
             ttl: msg.ttl,
-            body,
-            signature: msg.signature,
+            body: TieredMessageBody::from_routed(msg.body),
+            signature: Some(msg.signature),
             created_at: None,
             num_hops: 0,
         }
@@ -1088,7 +1148,7 @@ impl From<RoutedMessageV3> for RoutedMessage {
 /// sender of the package should be banned instead.
 /// If target is hash, it is a message that should be routed back using the same path used to route
 /// the request in first place. It is the hash of the request message.
-#[derive(PartialEq, Eq, Clone, Debug, ProtocolSchema)]
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Eq, Clone, Debug, ProtocolSchema)]
 pub enum RoutedMessage {
     V1(RoutedMessageV1),
     V2(RoutedMessageV2),
@@ -1117,6 +1177,7 @@ impl RoutedMessage {
     }
 
     /// Get the V1 message from the current version. Used for serializations (only V1 is sent over the wire).
+    /// TODO(13709): Remove V1 support after forward compatible release.
     pub fn msg_v1(self) -> RoutedMessageV1 {
         match self {
             RoutedMessage::V1(msg) => msg,
@@ -1126,7 +1187,13 @@ impl RoutedMessage {
                 author: msg.author,
                 ttl: msg.ttl,
                 body: msg.body.into(),
-                signature: msg.signature,
+                signature: msg.signature.unwrap_or_else(|| {
+                    tracing::error!(
+                        target: "network",
+                        "Signature is missing. This should not yet happen."
+                    );
+                    Signature::default()
+                }),
             },
         }
     }
@@ -1139,11 +1206,11 @@ impl RoutedMessage {
         }
     }
 
-    pub fn signature(&self) -> &Signature {
+    pub fn signature(&self) -> Option<&Signature> {
         match self {
-            RoutedMessage::V1(msg) => &msg.signature,
-            RoutedMessage::V2(msg) => &msg.msg.signature,
-            RoutedMessage::V3(msg) => &msg.signature,
+            RoutedMessage::V1(msg) => Some(&msg.signature),
+            RoutedMessage::V2(msg) => Some(&msg.msg.signature),
+            RoutedMessage::V3(msg) => msg.signature.as_ref(),
         }
     }
 
@@ -1247,7 +1314,7 @@ impl RoutedMessage {
                 author: msg.author.clone(),
                 ttl: msg.ttl,
                 body: TieredMessageBody::from_routed(msg.body.clone()),
-                signature: msg.signature.clone(),
+                signature: Some(msg.signature.clone()),
                 created_at: None,
                 num_hops: 0,
             });
@@ -1257,7 +1324,7 @@ impl RoutedMessage {
                 author: msg.msg.author.clone(),
                 ttl: msg.msg.ttl,
                 body: TieredMessageBody::from_routed(msg.msg.body.clone()),
-                signature: msg.msg.signature.clone(),
+                signature: Some(msg.msg.signature.clone()),
                 created_at: msg.created_at.map(|t| t.unix_timestamp()),
                 num_hops: msg.num_hops,
             });
@@ -1443,6 +1510,20 @@ impl StateResponseInfo {
         }
     }
 
+    pub fn part_id(&self) -> Option<u64> {
+        match self {
+            Self::V1(info) => info.state_response.part_id(),
+            Self::V2(info) => info.state_response.part_id(),
+        }
+    }
+
+    pub fn payload_length(&self) -> Option<usize> {
+        match self {
+            Self::V1(info) => info.state_response.payload_length(),
+            Self::V2(info) => info.state_response.payload_length(),
+        }
+    }
+
     pub fn take_state_response(self) -> ShardStateSyncResponse {
         match self {
             Self::V1(info) => ShardStateSyncResponse::V1(info.state_response),
@@ -1468,7 +1549,7 @@ impl RawRoutedMessage {
         let author = PeerId::new(node_key.public_key());
         let body = RoutedMessageBody::from(self.body.clone());
         let hash = RoutedMessage::build_hash(&self.target, &author, &body);
-        let signature = node_key.sign(hash.as_ref());
+        let signature = Some(node_key.sign(hash.as_ref()));
         RoutedMessage::V3(RoutedMessageV3 {
             target: self.target,
             author,

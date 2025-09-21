@@ -1,3 +1,5 @@
+use super::mem::ArenaMemory;
+use super::mem::node::MemTrieNodeView;
 use super::{Trie, TrieChanges, TrieRefcountDeltaMap};
 use crate::{NibbleSlice, PartialStorage, RawTrieNode, RawTrieNodeWithSize};
 use borsh::BorshDeserialize;
@@ -95,14 +97,34 @@ impl TrieRecorder {
     }
 
     pub fn record(&self, hash: &CryptoHash, node: Arc<[u8]>) {
-        let size = node.len();
-        let times_seen = self.recorded.entry(*hash).or_insert_with(|| node.into()).increment();
+        self.record_with(hash, move || node);
+    }
+
+    /// Just like "record", but takes a function which returns the serialized node.
+    /// Allows to avoid re-serializing the node when it has already been recorded.
+    pub fn record_with(&self, hash: &CryptoHash, get_serialized_node: impl FnOnce() -> Arc<[u8]>) {
+        let mut size_from_first_insert: Option<usize> = None;
+        self.recorded
+            .entry(*hash)
+            .or_insert_with(|| {
+                let serialized = get_serialized_node();
+                size_from_first_insert = Some(serialized.len());
+                serialized.into()
+            })
+            .increment();
 
         // Only do size accounting if this is the first time we see this value.
-        if times_seen == 1 {
+        if let Some(size) = size_from_first_insert {
             self.upper_bound_size.fetch_add(size, Ordering::Release).checked_add(size).unwrap();
             self.size.fetch_add(size, Ordering::Release);
         }
+    }
+
+    /// Convenience function to record memtrie nodes
+    pub fn record_memtrie_node<M: ArenaMemory>(&self, node_view: &MemTrieNodeView<'_, M>) {
+        self.record_with(&node_view.node_hash(), || {
+            borsh::to_vec(&node_view.to_raw_trie_node_with_size()).unwrap().into()
+        });
     }
 
     pub fn record_key_removal(&self) {
@@ -367,8 +389,8 @@ mod trie_recording_tests {
     use near_primitives::shard_layout::{ShardUId, get_block_shard_uid};
     use near_primitives::state::PartialState;
     use near_primitives::state::ValueRef;
-    use near_primitives::types::StateRoot;
     use near_primitives::types::chunk_extra::ChunkExtra;
+    use near_primitives::types::{Gas, StateRoot};
     use rand::prelude::SliceRandom;
     use rand::{Rng, random, thread_rng};
     use std::cell::{Cell, RefCell};
@@ -430,8 +452,8 @@ mod trie_recording_tests {
             &state_root,
             CryptoHash::default(),
             Vec::new(),
-            0,
-            0,
+            Gas::ZERO,
+            Gas::ZERO,
             0,
             Some(CongestionInfo::default()),
             BandwidthRequests::empty(),

@@ -44,6 +44,10 @@ pub const DEFAULT_STATE_SYNC_NUM_CONCURRENT_REQUESTS_ON_CATCHUP_EXTERNAL: u8 = 5
 /// before giving up and downloading it from external storage.
 pub const DEFAULT_EXTERNAL_STORAGE_FALLBACK_THRESHOLD: u64 = 3;
 
+/// We haven't observed meaningful gains from higher compression levels. Even `-5` produced a result close to
+/// levels 1–3. Therefore we keep 1 as the default.
+pub const DEFAULT_STATE_PARTS_COMPRESSION_LEVEL: i32 = 1;
+
 /// Describes the expected behavior of the node regarding shard tracking.
 /// If the node is an active validator, it will also track the shards it is responsible for as a validator.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -73,11 +77,30 @@ impl TrackedShardsConfig {
         matches!(self, TrackedShardsConfig::AllShards)
     }
 
+    pub fn tracks_non_empty_subset_of_shards(&self) -> bool {
+        match self {
+            TrackedShardsConfig::AllShards => true,
+            TrackedShardsConfig::Shards(shards) => !shards.is_empty(),
+            TrackedShardsConfig::NoShards
+            // The variants below do not guarantee that at least one shard will be continuously tracked.
+            | TrackedShardsConfig::Accounts(_)
+            | TrackedShardsConfig::Schedule(_)
+            | TrackedShardsConfig::ShadowValidator(_) => false,
+        }
+    }
+
     pub fn tracks_any_account(&self) -> bool {
         if let TrackedShardsConfig::Accounts(accounts) = &self {
             return !accounts.is_empty();
         }
         false
+    }
+
+    pub fn is_rpc(&self) -> bool {
+        match self {
+            TrackedShardsConfig::NoShards | TrackedShardsConfig::ShadowValidator(_) => false,
+            _ => true,
+        }
     }
 
     /// For backward compatibility, we support `tracked_shards`, `tracked_shard_schedule`,
@@ -184,7 +207,7 @@ pub struct ExternalStorageConfig {
     pub external_storage_fallback_threshold: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum ExternalStorageLocation {
     S3 {
@@ -199,6 +222,73 @@ pub enum ExternalStorageLocation {
     GCS {
         bucket: String,
     },
+}
+
+fn default_state_parts_compression_level() -> i32 {
+    DEFAULT_STATE_PARTS_COMPRESSION_LEVEL
+}
+
+/// Configures the external storage used by the archival node.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct CloudStorageConfig {
+    /// The storage to persist the archival data.
+    pub storage: ExternalStorageLocation,
+    /// Location of a json file with credentials allowing access to the bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials_file: Option<PathBuf>,
+}
+
+/// Configuration for a cloud-based archival reader.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct CloudArchivalReaderConfig {
+    /// Configures the external storage used by the archival node.
+    pub cloud_storage: CloudStorageConfig,
+}
+
+pub fn default_archival_writer_polling_interval() -> Duration {
+    Duration::seconds(1)
+}
+
+/// Configuration for a cloud-based archival writer. If this config is present, the writer is enabled and
+/// writes chunk-related data based on the tracked shards. This config also controls additional archival
+/// behavior such as block data and polling interval.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct CloudArchivalWriterConfig {
+    /// Configures the external storage used by the archival node.
+    pub cloud_storage: CloudStorageConfig,
+
+    /// Determines whether block-related data should be written to cloud storage.
+    #[serde(default)]
+    pub archive_block_data: bool,
+
+    /// Interval at which the system checks for new blocks or chunks to archive.
+    #[serde(with = "near_time::serde_duration_as_std")]
+    #[cfg_attr(feature = "schemars", schemars(with = "DurationAsStdSchemaProvider"))]
+    #[serde(default = "default_archival_writer_polling_interval")]
+    pub polling_interval: Duration,
+}
+
+// A handle that allows the main process to interrupt cloud archival actor if needed.
+#[derive(Clone)]
+pub struct CloudArchivalHandle {
+    keep_going: Arc<AtomicBool>,
+}
+
+impl CloudArchivalHandle {
+    pub fn new() -> Self {
+        Self { keep_going: Arc::new(AtomicBool::new(true)) }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        !self.get()
+    }
+
+    fn get(&self) -> bool {
+        self.keep_going.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Configures how to dump state to external storage.
@@ -218,7 +308,7 @@ pub struct DumpConfig {
     #[serde(with = "near_time::serde_opt_duration_as_std")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<DurationAsStdSchemaProvider>"))]
     pub iteration_delay: Option<Duration>,
-    /// Location of a json file with credentials allowing write access to the bucket.
+    /// Location of a json file with credentials allowing access to the bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credentials_file: Option<PathBuf>,
 }
@@ -301,6 +391,9 @@ pub struct StateSyncConfig {
         default = "SyncConcurrency::default"
     )]
     pub concurrency: SyncConcurrency,
+    /// Zstd compression level for state parts.
+    #[serde(default = "default_state_parts_compression_level")]
+    pub parts_compression_lvl: i32,
 }
 
 impl StateSyncConfig {
@@ -527,12 +620,16 @@ pub fn default_log_summary_period() -> Duration {
     Duration::seconds(10)
 }
 
-pub fn default_view_client_throttle_period() -> Duration {
+pub fn default_state_request_throttle_period() -> Duration {
     Duration::seconds(30)
 }
 
-pub fn default_view_client_num_state_requests_per_throttle_period() -> usize {
+pub fn default_state_requests_per_throttle_period() -> usize {
     30
+}
+
+pub fn default_state_request_server_threads() -> usize {
+    default_view_client_threads()
 }
 
 pub fn default_trie_viewer_state_size_limit() -> Option<u64> {
@@ -595,6 +692,15 @@ pub struct ChunkDistributionUris {
     pub get: String,
     /// URI for publishing chunks to the stream.
     pub set: String,
+}
+
+#[derive(Default, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+/// Configures whether the node checks the next or the next next epoch for network version compatibility.
+pub enum ProtocolVersionCheckConfig {
+    Next,
+    #[default]
+    NextNext,
 }
 
 /// ClientConfig where some fields can be updated at runtime.
@@ -693,6 +799,11 @@ pub struct ClientConfig {
     pub tracked_shards_config: TrackedShardsConfig,
     /// Not clear old data, set `true` for archive nodes.
     pub archive: bool,
+    /// Configuration for a cloud-based archival reader.
+    pub cloud_archival_reader: Option<CloudArchivalReaderConfig>,
+    /// Configuration for a cloud-based archival writer. If this config is present, the writer is enabled and
+    /// writes chunk-related data based on the tracked shards.
+    pub cloud_archival_writer: Option<CloudArchivalWriterConfig>,
     /// save_trie_changes should be set to true iff
     /// - archive if false - non-archival nodes need trie changes to perform garbage collection
     /// - archive is true, cold_store is configured and migration to split_storage is finished - node
@@ -700,6 +811,8 @@ pub struct ClientConfig {
     pub save_trie_changes: bool,
     /// Whether to persist transaction outcomes to disk or not.
     pub save_tx_outcomes: bool,
+    /// Whether to persist partial chunk parts for untracked shards or not.
+    pub save_untracked_partial_chunks_parts: bool,
     /// Number of threads for ViewClientActor pool.
     pub view_client_threads: usize,
     /// Number of threads for ChunkValidationActor pool.
@@ -707,9 +820,13 @@ pub struct ClientConfig {
     /// Number of seconds between state requests for view client.
     /// Throttling window for state requests (headers and parts).
     #[cfg_attr(feature = "schemars", schemars(with = "DurationSchemarsProvider"))]
-    pub view_client_throttle_period: Duration,
-    /// Maximum number of state requests served per `view_client_throttle_period`
-    pub view_client_num_state_requests_per_throttle_period: usize,
+    #[serde(alias = "view_client_throttle_period")]
+    pub state_request_throttle_period: Duration,
+    /// Maximum number of state requests served per throttle period
+    #[serde(alias = "view_client_num_state_requests_per_throttle_period")]
+    pub state_requests_per_throttle_period: usize,
+    /// Number of threads for StateRequestActor pool.
+    pub state_request_server_threads: usize,
     /// Upper bound of the byte size of contract state that is still viewable. None is no limit
     pub trie_viewer_state_size_limit: Option<u64>,
     /// Max burnt gas per view method.  If present, overrides value stored in
@@ -767,6 +884,9 @@ pub struct ClientConfig {
     /// This option can cause extra load on the database and is not recommended for production use.
     pub save_invalid_witnesses: bool,
     pub transaction_request_handler_threads: usize,
+    /// Determines whether client should exit if the protocol version is not supported
+    /// for the next or next next epoch.
+    pub protocol_version_check: ProtocolVersionCheckConfig,
 }
 
 impl ClientConfig {
@@ -828,13 +948,17 @@ impl ClientConfig {
             gc: GCConfig { gc_blocks_limit: 100, ..GCConfig::default() },
             tracked_shards_config: TrackedShardsConfig::NoShards,
             archive,
+            cloud_archival_reader: None,
+            cloud_archival_writer: None,
             save_trie_changes,
+            save_untracked_partial_chunks_parts: true,
             save_tx_outcomes: true,
             log_summary_style: LogSummaryStyle::Colored,
             view_client_threads: 1,
             chunk_validation_threads: 1,
-            view_client_throttle_period: Duration::seconds(1),
-            view_client_num_state_requests_per_throttle_period: 30,
+            state_request_throttle_period: Duration::seconds(1),
+            state_requests_per_throttle_period: 30,
+            state_request_server_threads: 1,
             trie_viewer_state_size_limit: None,
             max_gas_burnt_view: None,
             enable_statistics_export: true,
@@ -859,6 +983,7 @@ impl ClientConfig {
             save_latest_witnesses: false,
             save_invalid_witnesses: false,
             transaction_request_handler_threads: default_rpc_handler_thread_count(),
+            protocol_version_check: Default::default(),
         }
     }
 }

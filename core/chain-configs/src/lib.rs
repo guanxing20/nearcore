@@ -10,24 +10,27 @@ pub mod test_utils;
 mod updatable_config;
 
 pub use client_config::{
-    ChunkDistributionNetworkConfig, ChunkDistributionUris, ClientConfig,
-    DEFAULT_GC_NUM_EPOCHS_TO_KEEP, DEFAULT_STATE_SYNC_NUM_CONCURRENT_REQUESTS_EXTERNAL,
+    ChunkDistributionNetworkConfig, ChunkDistributionUris, ClientConfig, CloudArchivalHandle,
+    CloudArchivalReaderConfig, CloudArchivalWriterConfig, CloudStorageConfig,
+    DEFAULT_GC_NUM_EPOCHS_TO_KEEP, DEFAULT_STATE_PARTS_COMPRESSION_LEVEL,
+    DEFAULT_STATE_SYNC_NUM_CONCURRENT_REQUESTS_EXTERNAL,
     DEFAULT_STATE_SYNC_NUM_CONCURRENT_REQUESTS_ON_CATCHUP_EXTERNAL, DumpConfig, EpochSyncConfig,
     ExternalStorageConfig, ExternalStorageLocation, GCConfig, LogSummaryStyle,
-    MIN_GC_NUM_EPOCHS_TO_KEEP, ReshardingConfig, ReshardingHandle, StateSyncConfig,
-    SyncConcurrency, SyncConfig, TEST_STATE_SYNC_TIMEOUT, TrackedShardsConfig,
+    MIN_GC_NUM_EPOCHS_TO_KEEP, ProtocolVersionCheckConfig, ReshardingConfig, ReshardingHandle,
+    StateSyncConfig, SyncConcurrency, SyncConfig, TEST_STATE_SYNC_TIMEOUT, TrackedShardsConfig,
     default_chunk_validation_threads, default_chunk_wait_mult, default_enable_multiline_logging,
     default_epoch_sync, default_header_sync_expected_height_per_second,
     default_header_sync_initial_timeout, default_header_sync_progress_timeout,
     default_header_sync_stall_ban_timeout, default_log_summary_period,
     default_orphan_state_witness_max_size, default_orphan_state_witness_pool_size,
-    default_produce_chunk_add_transactions_time_limit, default_state_sync_enabled,
-    default_state_sync_external_backoff, default_state_sync_external_timeout,
-    default_state_sync_p2p_timeout, default_state_sync_retry_backoff, default_sync_check_period,
-    default_sync_height_threshold, default_sync_max_block_requests, default_sync_step_period,
-    default_transaction_pool_size_limit, default_trie_viewer_state_size_limit,
-    default_tx_routing_height_horizon, default_view_client_num_state_requests_per_throttle_period,
-    default_view_client_threads, default_view_client_throttle_period,
+    default_produce_chunk_add_transactions_time_limit, default_state_request_server_threads,
+    default_state_request_throttle_period, default_state_requests_per_throttle_period,
+    default_state_sync_enabled, default_state_sync_external_backoff,
+    default_state_sync_external_timeout, default_state_sync_p2p_timeout,
+    default_state_sync_retry_backoff, default_sync_check_period, default_sync_height_threshold,
+    default_sync_max_block_requests, default_sync_step_period, default_transaction_pool_size_limit,
+    default_trie_viewer_state_size_limit, default_tx_routing_height_horizon,
+    default_view_client_threads,
 };
 pub use genesis_config::{
     Genesis, GenesisChangeConfig, GenesisConfig, GenesisContents, GenesisRecords,
@@ -50,7 +53,7 @@ pub const PROTOCOL_TREASURY_ACCOUNT: &str = "near";
 pub const PROTOCOL_UPGRADE_STAKE_THRESHOLD: Rational32 = Rational32::new_raw(4, 5);
 
 /// Initial gas limit.
-pub const INITIAL_GAS_LIMIT: Gas = 1_000_000_000_000_000;
+pub const INITIAL_GAS_LIMIT: Gas = Gas::from_teragas(1000);
 
 /// Criterion for kicking out block producers.
 pub const BLOCK_PRODUCER_KICKOUT_THRESHOLD: u8 = 90;

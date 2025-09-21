@@ -17,6 +17,7 @@ chrono.workspace = true
 crossbeam-channel.workspace = true
 easy-ext.workspace = true
 enum-map.workspace = true
+futures.workspace = true
 itertools.workspace = true
 lru.workspace = true
 num-rational.workspace = true
@@ -36,6 +37,7 @@ tracing.workspace = true
 reed-solomon-erasure.workspace = true
 
 near-async.workspace = true
+near-cache.workspace = true
 near-chain-configs = { workspace = true, features = [
     "test_genesis",
     "test_utils",

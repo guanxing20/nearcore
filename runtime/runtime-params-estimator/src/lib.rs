@@ -105,7 +105,7 @@ use near_primitives::transaction::{
     Action, AddKeyAction, CreateAccountAction, DeleteAccountAction, DeleteKeyAction,
     DeployContractAction, SignedTransaction, StakeAction, TransferAction,
 };
-use near_primitives::types::AccountId;
+use near_primitives::types::{AccountId, Gas};
 use near_primitives::version::PROTOCOL_VERSION;
 use near_vm_runner::ContractCode;
 use near_vm_runner::MockContractRuntimeCache;
@@ -260,6 +260,7 @@ static ALL_COSTS: &[(Cost, fn(&mut EstimatorContext) -> GasCost)] = &[
     (Cost::StorageRemoveRetValueByte, storage_remove_ret_value_byte),
     (Cost::TouchingTrieNode, touching_trie_node),
     (Cost::ReadCachedTrieNode, read_cached_trie_node),
+    (Cost::ReadTrieNodeEstimateByIteration, read_trie_node_estimate_by_iteration),
     (Cost::ApplyBlock, apply_block_cost),
     (Cost::ContractCompileBase, contract_compile_base),
     (Cost::ContractCompileBytes, contract_compile_bytes),
@@ -622,7 +623,7 @@ fn action_deploy_contract_per_byte(ctx: &mut EstimatorContext) -> GasCost {
     // tolerance is chosen, quite arbitrarily, as a full base cost from protocol
     // v50. Values further in the negative indicate that the estimation error is
     // out of proportion.
-    let negative_base_tolerance = 369_531_500_000u64;
+    let negative_base_tolerance = Gas::from_gas(369_531_500_000u64);
     // For icount-based measurements, since we start compilation after the full
     // contract is already loaded into memory, it is possible that IO costs per
     // byte are essentially 0 and sometimes negative in the fitted curve. If
@@ -935,7 +936,7 @@ fn wasm_instruction(ctx: &mut EstimatorContext) -> GasCost {
 
     let instructions_per_iter = {
         let op_cost = config.regular_op_cost as u64;
-        warmup_outcome.burnt_gas / op_cost
+        warmup_outcome.burnt_gas.as_gas() / op_cost
     };
 
     let per_instruction = total / (instructions_per_iter * n_iters);
@@ -1307,6 +1308,19 @@ fn read_cached_trie_node(ctx: &mut EstimatorContext) -> GasCost {
 
     let results = (0..(warmup_iters + iters))
         .map(|_| trie::read_node_from_accounting_cache(&mut testbed))
+        .skip(warmup_iters)
+        .collect::<Vec<_>>();
+    average_cost(results)
+}
+
+fn read_trie_node_estimate_by_iteration(ctx: &mut EstimatorContext) -> GasCost {
+    let warmup_iters = ctx.config.warmup_iters_per_block;
+    let iters = ctx.config.iter_per_block;
+    let max_read_bytes = 1024 * 1024;
+    let mut testbed = ctx.testbed();
+
+    let results = (0..(warmup_iters + iters))
+        .map(|_| trie::read_trie_node_estimate_by_iteration(&mut testbed, max_read_bytes))
         .skip(warmup_iters)
         .collect::<Vec<_>>();
     average_cost(results)

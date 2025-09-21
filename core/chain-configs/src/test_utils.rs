@@ -1,19 +1,23 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use near_crypto::{InMemorySigner, PublicKey};
 use near_primitives::account::{AccessKey, Account, AccountContract};
 use near_primitives::hash::CryptoHash;
 use near_primitives::shard_layout::ShardLayout;
 use near_primitives::state_record::StateRecord;
-use near_primitives::types::{AccountId, AccountInfo, Balance, NumSeats, NumShards};
+use near_primitives::types::{AccountId, AccountInfo, Balance, Gas, NumSeats, NumShards};
 use near_primitives::utils::{from_timestamp, generate_random_string};
 use near_primitives::version::PROTOCOL_VERSION;
 use near_time::Clock;
 use num_rational::Ratio;
 
+use crate::client_config::default_archival_writer_polling_interval;
 use crate::{
-    FAST_EPOCH_LENGTH, GAS_PRICE_ADJUSTMENT_RATE, Genesis, GenesisConfig, INITIAL_GAS_LIMIT,
-    MAX_INFLATION_RATE, MIN_GAS_PRICE, NEAR_BASE, NUM_BLOCKS_PER_YEAR, PROTOCOL_REWARD_RATE,
-    PROTOCOL_TREASURY_ACCOUNT, TRANSACTION_VALIDITY_PERIOD,
+    CloudArchivalReaderConfig, CloudArchivalWriterConfig, CloudStorageConfig,
+    ExternalStorageLocation, FAST_EPOCH_LENGTH, GAS_PRICE_ADJUSTMENT_RATE, Genesis, GenesisConfig,
+    INITIAL_GAS_LIMIT, MAX_INFLATION_RATE, MIN_GAS_PRICE, NEAR_BASE, NUM_BLOCKS_PER_YEAR,
+    PROTOCOL_REWARD_RATE, PROTOCOL_TREASURY_ACCOUNT, TRANSACTION_VALIDITY_PERIOD,
 };
 
 /// Initial balance used in tests.
@@ -27,7 +31,7 @@ impl GenesisConfig {
         GenesisConfig {
             genesis_time: from_timestamp(clock.now_utc().unix_timestamp_nanos() as u64),
             genesis_height: 0,
-            gas_limit: 10u64.pow(15),
+            gas_limit: Gas::from_teragas(1000),
             min_gas_price: 0,
             max_gas_price: 1_000_000_000,
             total_supply: 1_000_000_000,
@@ -217,4 +221,20 @@ pub fn get_initial_supply(records: &[StateRecord]) -> Balance {
         }
     }
     total_supply
+}
+
+pub fn test_cloud_archival_configs(
+    cloud_archival_dir: impl Into<PathBuf>,
+) -> (CloudArchivalReaderConfig, CloudArchivalWriterConfig) {
+    let cloud_storage = CloudStorageConfig {
+        storage: ExternalStorageLocation::Filesystem { root_dir: cloud_archival_dir.into() },
+        credentials_file: None,
+    };
+    let reader_config = CloudArchivalReaderConfig { cloud_storage: cloud_storage.clone() };
+    let writer_config = CloudArchivalWriterConfig {
+        cloud_storage,
+        archive_block_data: true,
+        polling_interval: default_archival_writer_polling_interval(),
+    };
+    (reader_config, writer_config)
 }

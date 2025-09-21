@@ -10,9 +10,8 @@ use near_primitives::hash::CryptoHash;
 use near_primitives::shard_layout::ShardUId;
 use near_primitives::transaction::SignedTransaction;
 use near_store::adapter::StoreAdapter;
-use near_store::config::{STATE_SNAPSHOT_DIR, StateSnapshotType};
+use near_store::config::StateSnapshotType;
 use near_store::flat::FlatStorageManager;
-use near_store::trie::state_snapshots_dir;
 use near_store::{
     Mode, ShardTries, StateSnapshotConfig, StoreConfig, TrieConfig, config::TrieCacheConfig,
     test_utils::create_test_store,
@@ -61,11 +60,10 @@ fn set_up_test_env_for_state_snapshots(
 ) -> StateSnapshotTestEnv {
     let home_dir =
         tempfile::Builder::new().prefix("storage").tempdir().unwrap().path().to_path_buf();
-    let state_snapshots_dir = state_snapshots_dir(&home_dir, "data", STATE_SNAPSHOT_DIR);
+    let enabled_state_snapshot_config = StateSnapshotConfig::enabled(home_dir.join("data"));
+    let state_snapshots_dir = enabled_state_snapshot_config.state_snapshots_dir().unwrap().into();
     let state_snapshot_config = match snapshot_type {
-        StateSnapshotType::Enabled => {
-            StateSnapshotConfig::Enabled { state_snapshots_dir: state_snapshots_dir.clone() }
-        }
+        StateSnapshotType::Enabled => enabled_state_snapshot_config,
         StateSnapshotType::Disabled => StateSnapshotConfig::Disabled,
     };
 
@@ -191,7 +189,7 @@ fn verify_make_snapshot(
     }
     // check that the stored snapshot in file system is an actual snapshot
     let store_config = StoreConfig::default();
-    let opener = NodeStorage::opener(&snapshot_path, &store_config, None);
+    let opener = NodeStorage::opener(&snapshot_path, &store_config, None, None);
     let _storage = opener.open_in_mode(Mode::ReadOnly)?;
     // check that there's only one snapshot at the parent directory of snapshot path
     let parent_path = snapshot_path

@@ -1,9 +1,6 @@
-use actix::Addr;
-use actix_rt::ArbiterHandle;
 use futures::future;
 use near_actix_test_utils::{run_actix, spawn_interruptible};
 use near_chain_configs::{Genesis, TrackedShardsConfig};
-use near_client::{ClientActor, ViewClientActor};
 use near_network::tcp;
 use near_network::test_utils::convert_boot_nodes;
 use near_o11y::testonly::init_integration_logger;
@@ -11,6 +8,11 @@ use near_primitives::types::{BlockHeight, BlockHeightDelta, NumSeats, NumShards}
 use nearcore::{load_test_config, start_with_config};
 
 use crate::utils::test_helpers::heavy_test;
+use near_async::ActorSystem;
+use near_async::multithread::MultithreadRuntimeHandle;
+use near_async::tokio::TokioRuntimeHandle;
+use near_client::ViewClientActorInner;
+use near_client::client_actor::ClientActorInner;
 
 fn start_nodes(
     temp_dir: &std::path::Path,
@@ -21,7 +23,11 @@ fn start_nodes(
     epoch_length: BlockHeightDelta,
     genesis_height: BlockHeight,
     save_tx_outcomes: Option<bool>,
-) -> (Genesis, Vec<String>, Vec<(Addr<ClientActor>, Addr<ViewClientActor>, Vec<ArbiterHandle>)>) {
+) -> (
+    Genesis,
+    Vec<String>,
+    Vec<(TokioRuntimeHandle<ClientActorInner>, MultithreadRuntimeHandle<ViewClientActorInner>)>,
+) {
     init_integration_logger();
 
     let num_tracking_nodes = num_nodes - num_lightclient;
@@ -59,12 +65,13 @@ fn start_nodes(
     }
 
     let mut res = vec![];
+    let actor_system = ActorSystem::new();
     for (i, near_config) in near_configs.into_iter().enumerate() {
         let dir = temp_dir.join(format!("node{i}"));
         std::fs::create_dir(&dir).unwrap();
-        let nearcore::NearNode { client, view_client, arbiters, .. } =
-            start_with_config(&dir, near_config).expect("start_with_config");
-        res.push((client, view_client, arbiters))
+        let nearcore::NearNode { client, view_client, .. } =
+            start_with_config(&dir, near_config, actor_system.clone()).expect("start_with_config");
+        res.push((client, view_client))
     }
     (genesis, rpc_addrs, res)
 }
@@ -123,9 +130,8 @@ impl NodeCluster {
             near_chain_configs::Genesis,
             Vec<String>,
             Vec<(
-                actix::Addr<ClientActor>,
-                actix::Addr<ViewClientActor>,
-                Vec<actix_rt::ArbiterHandle>,
+                TokioRuntimeHandle<ClientActorInner>,
+                MultithreadRuntimeHandle<ViewClientActorInner>,
             )>,
         ) -> R,
     {

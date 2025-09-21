@@ -1,8 +1,7 @@
 use crate::tests::nearcore::node_cluster::NodeCluster;
-use actix::System;
+use near_async::messaging::CanSendAsync;
 use near_client::GetBlock;
 use near_network::test_utils::wait_or_timeout;
-use near_o11y::WithSpanContextExt;
 use near_primitives::types::{BlockHeightDelta, NumSeats, NumShards};
 use rand::{Rng, thread_rng};
 use std::ops::ControlFlow;
@@ -29,7 +28,7 @@ fn run_heavy_nodes(
         let view_client = clients.last().unwrap().1.clone();
 
         wait_or_timeout(100, 40000, || async {
-            let res = view_client.send(GetBlock::latest().with_span_context()).await;
+            let res = view_client.send_async(GetBlock::latest()).await;
             match &res {
                 Ok(Ok(b)) if b.header.height > num_blocks => return ControlFlow::Break(()),
                 Err(_) => return ControlFlow::Continue(()),
@@ -39,7 +38,7 @@ fn run_heavy_nodes(
         })
         .await
         .unwrap();
-        System::current().stop()
+        near_async::shutdown_all_actors();
     });
 
     // See https://github.com/near/nearcore/issues/3925 for why it is here.

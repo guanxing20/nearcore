@@ -1,18 +1,18 @@
 use crate::tests::nearcore::node_cluster::NodeCluster;
 use crate::utils::genesis_helpers::genesis_block;
+use actix::Actor;
 use actix::clock::sleep;
-use actix::{Actor, System};
 use assert_matches::assert_matches;
 
 use futures::future::join_all;
 use futures::{FutureExt, TryFutureExt, future};
 use near_actix_test_utils::spawn_interruptible;
+use near_async::messaging::CanSendAsync;
 use near_client::{GetBlock, GetExecutionOutcome, GetValidatorInfo};
 use near_crypto::InMemorySigner;
 use near_jsonrpc::client::new_client;
 use near_jsonrpc_primitives::types::transactions::{RpcTransactionStatusRequest, TransactionInfo};
 use near_network::test_utils::WaitOrTimeoutActor;
-use near_o11y::WithSpanContextExt;
 use near_o11y::testonly::init_integration_logger;
 use near_parameters::{RuntimeConfigStore, RuntimeConfigView};
 use near_primitives::hash::{CryptoHash, hash};
@@ -43,8 +43,7 @@ fn test_get_validator_info_rpc() {
                 let rpc_addrs_copy = rpc_addrs.clone();
                 let view_client = clients[0].1.clone();
                 spawn_interruptible(async move {
-                    let block_view =
-                        view_client.send(GetBlock::latest().with_span_context()).await.unwrap();
+                    let block_view = view_client.send_async(GetBlock::latest()).await.unwrap();
                     if let Err(err) = block_view {
                         println!("Failed to get the latest block: {:?}", err);
                         return;
@@ -60,7 +59,7 @@ fn test_get_validator_info_rpc() {
                         let res = client.validators(None).await.unwrap();
                         assert_eq!(res.current_validators.len(), 1);
                         assert!(res.current_validators.iter().any(|r| r.account_id == "near.0"));
-                        System::current().stop();
+                        near_async::shutdown_all_actors();
                     }
                 });
             }),
@@ -155,17 +154,15 @@ fn test_get_execution_outcome(is_tx_successful: bool) {
                                 }),
                             ) {
                                 let view_client2 = view_client1.clone();
-                                let fut = view_client1
-                                    .send(GetExecutionOutcome { id }.with_span_context());
+                                let fut = view_client1.send_async(GetExecutionOutcome { id });
                                 let fut = fut.then(move |res| {
                                     let execution_outcome_response = res.unwrap().unwrap();
                                     view_client2
-                                        .send(
-                                            GetBlock(BlockReference::BlockId(BlockId::Hash(
+                                        .send_async(GetBlock(BlockReference::BlockId(
+                                            BlockId::Hash(
                                                 execution_outcome_response.outcome_proof.block_hash,
-                                            )))
-                                            .with_span_context(),
-                                        )
+                                            ),
+                                        )))
                                         .then(move |res| {
                                             let res = res.unwrap().unwrap();
                                             let mut outcome_with_id_to_hash =
@@ -189,7 +186,7 @@ fn test_get_execution_outcome(is_tx_successful: bool) {
                                 futures.push(fut);
                             }
                             spawn_interruptible(join_all(futures).then(|_| {
-                                System::current().stop();
+                                near_async::shutdown_all_actors();
                                 future::ready(())
                             }));
                             future::ready(())
@@ -253,7 +250,7 @@ fn test_protocol_config_rpc() {
             serde_json::json!(config_response.config_view.runtime_config),
             serde_json::json!(RuntimeConfigView::from(latest_runtime_config.as_ref().clone()))
         );
-        System::current().stop();
+        near_async::shutdown_all_actors();
     });
 }
 
@@ -291,7 +288,7 @@ fn test_query_rpc_account_view_must_succeed() {
                 );
             };
         assert_matches!(account, near_primitives::views::AccountView { .. });
-        System::current().stop();
+        near_async::shutdown_all_actors();
     });
 }
 
@@ -341,7 +338,7 @@ fn test_query_rpc_account_view_account_does_not_exist_must_return_error() {
             error_message
         );
 
-        System::current().stop();
+        near_async::shutdown_all_actors();
     });
 }
 
@@ -375,7 +372,7 @@ fn slow_test_tx_not_enough_balance_must_return_error() {
 
         spawn_interruptible(async move {
             loop {
-                let res = view_client.send(GetBlock::latest().with_span_context()).await;
+                let res = view_client.send_async(GetBlock::latest()).await;
                 if let Ok(Ok(block)) = res {
                     if block.header.height > 10 {
                         break;
@@ -404,7 +401,7 @@ fn slow_test_tx_not_enough_balance_must_return_error() {
                             }
                         }})
                     );
-                    System::current().stop();
+                    near_async::shutdown_all_actors();
                 })
                 .map_ok(|_| panic!("Transaction must not succeed"))
                 .await;
@@ -443,7 +440,7 @@ fn slow_test_check_unknown_tx_must_return_error() {
 
         spawn_interruptible(async move {
             loop {
-                let res = view_client.send(GetBlock::latest().with_span_context()).await;
+                let res = view_client.send_async(GetBlock::latest()).await;
                 if let Ok(Ok(block)) = res {
                     if block.header.height > 10 {
                         let _ = client
@@ -462,7 +459,7 @@ fn slow_test_check_unknown_tx_must_return_error() {
                                         tx_hash
                                     ))
                                 );
-                                System::current().stop();
+                                near_async::shutdown_all_actors();
                             })
                             .map_ok(|_| panic!("Transaction must be unknown"))
                             .await;
@@ -505,7 +502,7 @@ fn test_tx_status_on_lightclient_must_return_does_not_track_shard() {
 
         spawn_interruptible(async move {
             loop {
-                let res = view_client.send(GetBlock::latest().with_span_context()).await;
+                let res = view_client.send_async(GetBlock::latest()).await;
                 if let Ok(Ok(block)) = res {
                     if block.header.height > 10 {
                         let request = RpcTransactionStatusRequest {
@@ -519,7 +516,7 @@ fn test_tx_status_on_lightclient_must_return_does_not_track_shard() {
                                     *err.data.unwrap(),
                                     serde_json::json!("Node doesn't track this shard. Cannot determine whether the transaction is valid")
                                 );
-                                System::current().stop();
+                                near_async::shutdown_all_actors();
                             })
                             .map_ok(|_| panic!("Must not track shard"))
                             .await;
@@ -548,7 +545,7 @@ fn test_validators_by_epoch_id_current_epoch_not_fails() {
 
         spawn_interruptible(async move {
             let final_block = loop {
-                let res = view_client.send(GetBlock::latest().with_span_context()).await;
+                let res = view_client.send_async(GetBlock::latest()).await;
                 if let Ok(Ok(block)) = res {
                     if block.header.height > 1 {
                         break block;
@@ -557,20 +554,15 @@ fn test_validators_by_epoch_id_current_epoch_not_fails() {
             };
 
             let res = view_client
-                .send(
-                    GetValidatorInfo {
-                        epoch_reference: EpochReference::EpochId(EpochId(
-                            final_block.header.epoch_id,
-                        )),
-                    }
-                    .with_span_context(),
-                )
+                .send_async(GetValidatorInfo {
+                    epoch_reference: EpochReference::EpochId(EpochId(final_block.header.epoch_id)),
+                })
                 .await;
 
             match res {
                 Ok(Ok(validators)) => {
                     assert_eq!(validators.current_validators.len(), 1);
-                    System::current().stop();
+                    near_async::shutdown_all_actors();
                 }
                 err => panic!("Validators list by EpochId must succeed: {:?}", err),
             }
