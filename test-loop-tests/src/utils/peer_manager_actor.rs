@@ -9,7 +9,7 @@ use near_async::messaging::{
 };
 use near_async::test_loop::sender::TestLoopSender;
 use near_async::time::{Clock, Duration};
-use near_async::{MultiSend, MultiSenderFrom};
+use near_async::{Message, MultiSend, MultiSenderFrom};
 use near_chain::{Block, BlockHeader};
 use near_client::spice_data_distributor_actor::SpiceDistributorOutgoingReceipts;
 use near_client::{BlockApproval, BlockResponse, SetNetworkInfo};
@@ -71,8 +71,7 @@ pub struct SpiceDataDistributorSenderForTestLoopNetwork {
 
 /// This message is used to allow TestLoopPeerManagerActor to construct NetworkInfo for each
 /// client.
-#[derive(actix::Message, Debug, Clone, PartialEq, Eq)]
-#[rtype(result = "()")]
+#[derive(Message, Debug, Clone, PartialEq, Eq)]
 pub struct TestLoopNetworkBlockInfo {
     pub peer: PeerInfo,
     pub block_header: BlockHeader,
@@ -709,10 +708,7 @@ fn network_message_to_spice_data_distributor_handler(
                 shared_state
                     .senders_for_account(&my_account_id, &account_id)
                     .spice_data_distributor_actor
-                    .send(SpiceIncomingPartialData {
-                        data: partial_data.clone(),
-                        sender: my_account_id.clone(),
-                    });
+                    .send(SpiceIncomingPartialData { data: partial_data.clone() });
             }
             None
         }

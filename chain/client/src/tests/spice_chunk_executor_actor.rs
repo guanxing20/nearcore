@@ -3,22 +3,22 @@ use itertools::Itertools as _;
 use near_async::futures::AsyncComputationSpawner;
 use near_async::messaging::Handler;
 use near_async::messaging::IntoSender;
+use near_async::messaging::Message;
 use near_async::messaging::Sender;
 use near_async::time::Clock;
+use near_chain::ApplyChunksIterationMode;
 use near_chain::ChainStoreAccess;
 use near_chain::spice_core::CoreStatementsProcessor;
 use near_chain::spice_core::ExecutionResultEndorsed;
-use near_chain::stateless_validation::chunk_validation::{
-    MainStateTransitionCache, validate_chunk_state_witness,
-};
 use near_chain::stateless_validation::spice_chunk_validation::spice_pre_validate_chunk_state_witness;
+use near_chain::stateless_validation::spice_chunk_validation::spice_validate_chunk_state_witness;
 use near_chain::test_utils::{
     get_chain_with_genesis, get_fake_next_block_chunk_headers, process_block_sync,
 };
 use near_chain::{Block, Chain, ChainGenesis};
 use near_chain::{BlockProcessingArtifact, Provenance};
 use near_chain_configs::MutableValidatorSigner;
-use near_chain_configs::test_genesis::{ONE_NEAR, TestGenesisBuilder, ValidatorsSpec};
+use near_chain_configs::test_genesis::{TestGenesisBuilder, ValidatorsSpec};
 use near_chain_configs::{Genesis, MutableConfigValue, TrackedShardsConfig};
 use near_epoch_manager::shard_tracker::ShardTracker;
 use near_network::types::{NetworkRequests, PeerManagerAdapter, PeerManagerMessageRequest};
@@ -29,12 +29,11 @@ use near_primitives::shard_layout::ShardLayout;
 use near_primitives::sharding::ShardChunk;
 use near_primitives::stateless_validation::chunk_endorsement::ChunkEndorsement;
 use near_primitives::test_utils::{TestBlockBuilder, create_test_signer};
-use near_primitives::types::AccountId;
-use near_primitives::types::ShardId;
-use near_primitives::types::{BlockExecutionResults, ChunkExecutionResult, NumShards};
+use near_primitives::types::{
+    AccountId, Balance, BlockExecutionResults, ChunkExecutionResult, NumShards, ShardId,
+};
 use near_store::ShardUId;
 use near_store::adapter::StoreAdapter as _;
-use reed_solomon_erasure::ReedSolomon;
 use std::collections::HashMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -74,7 +73,7 @@ struct TestActor {
 
 impl<M> Handler<M> for TestActor
 where
-    M: actix::Message,
+    M: Message,
     ChunkExecutorActor: Handler<M>,
 {
     fn handle(&mut self, msg: M) {
@@ -107,7 +106,6 @@ impl TestActor {
 
         let chain_genesis = ChainGenesis::new(&genesis.config);
         let runtime = chain.runtime_adapter.clone();
-        let genesis_hash = *chain.genesis().hash();
 
         let spice_core_processor = CoreStatementsProcessor::new_with_noop_senders(
             runtime.store().chain_store(),
@@ -121,7 +119,6 @@ impl TestActor {
         ));
 
         let (spawner, tasks_rc) = FakeSpawner::new();
-        let save_latest_witnesses = false;
         let (actor_sc, actor_rc) = unbounded();
         let chunk_executor_adapter = Sender::from_fn(move |event: ExecutorApplyChunksDone| {
             actor_sc.unbounded_send(event).unwrap();
@@ -161,7 +158,6 @@ impl TestActor {
         let actor = ChunkExecutorActor::new(
             runtime.store().clone(),
             &chain_genesis,
-            genesis_hash,
             runtime.clone(),
             epoch_manager,
             shard_tracker,
@@ -170,9 +166,9 @@ impl TestActor {
             spice_core_processor,
             chunk_endorsement_tracker,
             Arc::new(spawner),
+            ApplyChunksIterationMode::Sequential,
             chunk_executor_adapter,
             data_distributor_adapter,
-            save_latest_witnesses,
         );
         TestActor { chain, actor, actor_rc, tasks_rc }
     }
@@ -196,7 +192,7 @@ impl TestActor {
 
     fn handle_with_internal_events<M>(&mut self, msg: M)
     where
-        M: actix::Message,
+        M: Message,
         ChunkExecutorActor: Handler<M>,
     {
         self.actor.handle(msg);
@@ -227,7 +223,7 @@ fn setup_with_shards(
         .epoch_length(epoch_length)
         .shard_layout(shard_layout.clone())
         .validators_spec(validators_spec)
-        .add_user_accounts_simple(&accounts, ONE_NEAR)
+        .add_user_accounts_simple(&accounts, Balance::from_near(1))
         .build();
 
     signers
@@ -251,7 +247,7 @@ fn setup_with_non_validator(outgoing_sc: UnboundedSender<OutgoingMessage>) -> [T
         .genesis_time_from_clock(&Clock::real())
         .shard_layout(shard_layout.clone())
         .validators_spec(ValidatorsSpec::desired_roles(&["test1"], &[]))
-        .add_user_account_simple(signer.validator_id().clone(), ONE_NEAR)
+        .add_user_account_simple(signer.validator_id().clone(), Balance::from_near(1))
         .build();
 
     [
@@ -398,7 +394,8 @@ fn record_endorsements(actors: &mut [TestActor], block: &Block) {
                 *epoch_id,
                 execution_result.clone(),
                 *block.header().hash(),
-                chunk,
+                chunk.shard_id(),
+                chunk.height_created(),
                 &signer,
             );
             for actor in actors.iter() {
@@ -594,7 +591,7 @@ fn test_not_executing_with_bad_receipts() {
         };
         receipt_proofs[0].0.push(Receipt::new_balance_refund(
             &AccountId::from_str("test1").unwrap(),
-            ONE_NEAR,
+            Balance::from_near(1),
             ReceiptPriority::NoPriority,
         ));
         simulate_single_outgoing_message(&mut actors, &message);
@@ -629,7 +626,7 @@ fn test_extra_pending_bad_receipt_proof_does_not_prevent_execution() {
         let mut extra_proof = receipt_proofs[0].clone();
         extra_proof.0.push(Receipt::new_balance_refund(
             &AccountId::from_str("test1").unwrap(),
-            ONE_NEAR,
+            Balance::from_near(1),
             ReceiptPriority::NoPriority,
         ));
         receipt_proofs.push(extra_proof);
@@ -769,17 +766,12 @@ fn test_witness_is_valid() {
         )
         .unwrap();
 
-        let save_witness_if_invalid = false;
         assert!(
-            validate_chunk_state_witness(
+            spice_validate_chunk_state_witness(
                 state_witness,
                 pre_validation_result,
                 actor.actor.epoch_manager.as_ref(),
                 actor.actor.runtime_adapter.as_ref(),
-                &MainStateTransitionCache::default(),
-                actor.actor.chain_store.store(),
-                save_witness_if_invalid,
-                Arc::new(ReedSolomon::new(1, 1).unwrap()),
             )
             .is_ok()
         );

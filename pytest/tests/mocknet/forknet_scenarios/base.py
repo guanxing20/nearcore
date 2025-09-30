@@ -87,6 +87,7 @@ class TestSetup:
             num_chunk_producer_seats=0, num_chunk_validator_seats=0)
         # The base binary url to be used for the nodes.
         self.neard_binary_url = getattr(args, 'neard_binary_url', '')
+        self.upgrade_delay_minutes = 0
         # The new binary url to be used for the nodes.
         self.neard_upgrade_binary_url = getattr(args,
                                                 'neard_upgrade_binary_url', '')
@@ -157,7 +158,6 @@ class TestSetup:
         new_test_args.num_validators = self.node_hardware_config.num_chunk_validator_seats
         # Set all seats to the lower value. This will be increased later in epoch config.
         new_test_args.num_seats = self.node_hardware_config.num_chunk_producer_seats
-        new_test_args.stateless_setup = True
         new_test_args.new_chain_id = self.unique_id
         new_test_args.yes = True
         new_test_args.gcs_state_sync = self.has_state_dumper
@@ -257,9 +257,10 @@ class TestSetup:
             return time.astimezone(
                 timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
-        now = datetime.now()
+        ref_time = datetime.now() + timedelta(
+            minutes=self.upgrade_delay_minutes)
         for i in range(1, 5):
-            restart_time = now + timedelta(minutes=i * minutes)
+            restart_time = ref_time + timedelta(minutes=i * minutes)
             start_nodes_args = copy.deepcopy(self.args)
             start_nodes_args.host_type = 'nodes'
             start_nodes_args.select_partition = (i, 4)

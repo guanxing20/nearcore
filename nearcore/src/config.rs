@@ -16,7 +16,7 @@ use near_chain_configs::{
     GAS_PRICE_ADJUSTMENT_RATE, GCConfig, GENESIS_CONFIG_FILENAME, Genesis, GenesisConfig,
     GenesisValidationMode, INITIAL_GAS_LIMIT, LogSummaryStyle, MAX_INFLATION_RATE,
     MIN_BLOCK_PRODUCTION_DELAY, MIN_GAS_PRICE, MutableConfigValue, MutableValidatorSigner,
-    NEAR_BASE, NUM_BLOCK_PRODUCER_SEATS, NUM_BLOCKS_PER_YEAR, PROTOCOL_REWARD_RATE,
+    NUM_BLOCK_PRODUCER_SEATS, NUM_BLOCKS_PER_YEAR, PROTOCOL_REWARD_RATE,
     PROTOCOL_UPGRADE_STAKE_THRESHOLD, ProtocolVersionCheckConfig, ReshardingConfig,
     StateSyncConfig, TRANSACTION_VALIDITY_PERIOD, TrackedShardsConfig,
     default_chunk_validation_threads, default_chunk_wait_mult, default_enable_multiline_logging,
@@ -47,8 +47,7 @@ use near_primitives::network::PeerId;
 use near_primitives::shard_layout::ShardLayout;
 use near_primitives::test_utils::create_test_signer;
 use near_primitives::types::{
-    AccountId, AccountInfo, Balance, BlockHeight, BlockHeightDelta, Gas, NumSeats, NumShards,
-    ShardId,
+    AccountId, AccountInfo, BlockHeight, BlockHeightDelta, Gas, NumSeats, NumShards, ShardId,
 };
 use near_primitives::utils::{from_timestamp, get_num_seats_per_shard};
 use near_primitives::validator_signer::{InMemoryValidatorSigner, ValidatorSigner};
@@ -67,9 +66,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
-
-/// Millinear, 1/1000 of NEAR.
-pub const MILLI_NEAR: Balance = NEAR_BASE / 1000;
 
 /// Block production tracking delay.
 pub const BLOCK_PRODUCTION_TRACKING_DELAY: i64 = 10;
@@ -331,7 +327,6 @@ pub struct Config {
     /// Different parameters to configure underlying storage.
     pub store: near_store::StoreConfig,
     /// Different parameters to configure underlying cold storage.
-    /// This feature is under development, do not use in production.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cold_store: Option<near_store::StoreConfig>,
     /// Configuration for the split storage.
@@ -834,7 +829,6 @@ impl NightshadeRuntime {
             &config.config.contract_cache_path(),
             config.config.max_loaded_contracts,
         )?;
-        let state_parts_compression_lvl = config.client_config.state_sync.parts_compression_lvl;
         Ok(NightshadeRuntime::new(
             store,
             ContractRuntimeCache::handle(&contract_cache),
@@ -846,7 +840,7 @@ impl NightshadeRuntime {
             config.config.gc.gc_num_epochs_to_keep(),
             TrieConfig::from_store_config(&config.config.store),
             state_snapshot_config,
-            state_parts_compression_lvl,
+            config.client_config.state_sync.parts_compression_lvl,
         ))
     }
 }
@@ -969,6 +963,7 @@ pub fn init_configs(
     download_config_url: Option<&str>,
     boot_nodes: Option<&str>,
     max_gas_burnt_view: Option<Gas>,
+    state_sync_bucket: Option<&str>,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(dir).with_context(|| anyhow!("Failed to create directory {:?}", dir))?;
 
@@ -1010,6 +1005,9 @@ pub fn init_configs(
             .context(format!("Failed to download the config file from {}", url))?;
         config = Config::from_file(&dir.join(CONFIG_FILENAME))?;
     }
+    if let Some(bucket) = state_sync_bucket {
+        config.state_sync = Some(StateSyncConfig::gcs_with_bucket(bucket.to_string()));
+    }
 
     if let Some(nodes) = boot_nodes {
         config.network.boot_nodes = nodes.to_string();
@@ -1026,8 +1024,9 @@ pub fn init_configs(
             if test_seed.is_some() {
                 bail!("Test seed is not supported for {chain_id}");
             }
-            config.telemetry.endpoints.push(NETWORK_TELEMETRY_URL.to_string());
-            config.state_sync = Some(StateSyncConfig::gcs_default());
+            if !config.telemetry.endpoints.contains(&NETWORK_TELEMETRY_URL.to_string()) {
+                config.telemetry.endpoints.push(NETWORK_TELEMETRY_URL.to_string());
+            }
         }
         _ => {
             // Create new configuration, key files and genesis for one validator.
@@ -1721,6 +1720,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let genesis = Genesis::from_file(
@@ -1778,6 +1778,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1805,6 +1806,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
             None,
             None,
