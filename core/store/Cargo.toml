@@ -16,6 +16,7 @@ anyhow.workspace = true
 borsh.workspace = true
 bytesize.workspace = true
 crossbeam.workspace = true
+ahash.workspace = true
 dashmap = { workspace = true, features = ["raw-api"] }
 derive_more = { workspace = true, features = ["as_ref", "into"] }
 derive-where.workspace = true
@@ -31,7 +32,13 @@ rand.workspace = true
 rayon.workspace = true
 reed-solomon-erasure.workspace = true
 rlimit.workspace = true
-rocksdb.workspace = true
+rocksdb = { workspace = true, features = [
+    "snappy",
+    "lz4",
+    "zstd",
+    "zlib",
+    "jemalloc",
+] }
 serde.workspace = true
 serde_json.workspace = true
 static_assertions.workspace = true
@@ -46,6 +53,7 @@ near-async.workspace = true
 near-chain-configs = { workspace = true, features = ["metrics"] }
 near-chain-primitives.workspace = true
 near-crypto.workspace = true
+near-external-storage.workspace = true
 near-fmt.workspace = true
 near-o11y.workspace = true
 near-parameters.workspace = true
@@ -55,7 +63,6 @@ near-time.workspace = true
 near-vm-runner.workspace = true
 
 [dev-dependencies]
-actix.workspace = true
 assert_matches.workspace = true
 bencher.workspace = true
 insta.workspace = true
